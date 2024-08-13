@@ -1,89 +1,88 @@
 import React from 'react';
-import { Button, Checkbox, Field, Input } from '@grafana/ui';
-import { OptionElement } from './OptionElement';
-import { ChannelValues } from '../../../types/receiver-form';
-import { useFormContext, FieldError, FieldErrors } from 'react-hook-form';
+import { useFormContext, FieldError, FieldErrors, DeepMap } from 'react-hook-form';
+
+import { Button, Field, Input } from '@grafana/ui';
 import { NotificationChannelOption, NotificationChannelSecureFields } from 'app/types';
 
+import { ChannelValues, ReceiverFormValues } from '../../../types/receiver-form';
+
+import { OptionField } from './fields/OptionField';
+
 export interface Props<R extends ChannelValues> {
+  defaultValues: R;
   selectedChannelOptions: NotificationChannelOption[];
   secureFields: NotificationChannelSecureFields;
 
   onResetSecureField: (key: string) => void;
   errors?: FieldErrors<R>;
   pathPrefix?: string;
+  readOnly?: boolean;
+
+  customValidators?: Record<string, React.ComponentProps<typeof OptionField>['customValidator']>;
 }
 
 export function ChannelOptions<R extends ChannelValues>({
+  defaultValues,
   selectedChannelOptions,
   onResetSecureField,
   secureFields,
   errors,
   pathPrefix = '',
+  readOnly = false,
+  customValidators = {},
 }: Props<R>): JSX.Element {
-  const { register, watch } = useFormContext();
-  const currentFormValues = watch() as Record<string, any>; // react hook form types ARE LYING!
+  const { watch } = useFormContext<ReceiverFormValues<R>>();
+  const currentFormValues = watch(); // react hook form types ARE LYING!
   return (
     <>
       {selectedChannelOptions.map((option: NotificationChannelOption, index: number) => {
         const key = `${option.label}-${index}`;
         // Some options can be dependent on other options, this determines what is selected in the dependency options
         // I think this needs more thought.
+        // pathPrefix = items.index.
+        const paths = pathPrefix.split('.');
         const selectedOptionValue =
-          currentFormValues[`${pathPrefix}settings.${option.showWhen.field}`] &&
-          currentFormValues[`${pathPrefix}settings.${option.showWhen.field}`];
+          paths.length >= 2 ? currentFormValues.items[Number(paths[1])].settings[option.showWhen.field] : undefined;
 
         if (option.showWhen.field && selectedOptionValue !== option.showWhen.is) {
           return null;
         }
 
-        if (option.element === 'checkbox') {
+        if (secureFields && secureFields[option.propertyName]) {
           return (
-            <Field key={key}>
-              <Checkbox
-                {...register(
-                  option.secure
-                    ? `${pathPrefix}secureSettings.${option.propertyName}`
-                    : `${pathPrefix}settings.${option.propertyName}`
-                )}
-                label={option.label}
-                description={option.description}
+            <Field key={key} label={option.label} description={option.description || undefined}>
+              <Input
+                readOnly={true}
+                value="Configured"
+                suffix={
+                  readOnly ? null : (
+                    <Button onClick={() => onResetSecureField(option.propertyName)} fill="text" type="button" size="sm">
+                      Clear
+                    </Button>
+                  )
+                }
               />
             </Field>
           );
         }
 
-        const error: FieldError | undefined = ((option.secure ? errors?.secureSettings : errors?.settings) as
-          | Record<string, FieldError>
-          | undefined)?.[option.propertyName];
+        const error: FieldError | DeepMap<any, FieldError> | undefined = (
+          (option.secure ? errors?.secureSettings : errors?.settings) as DeepMap<any, FieldError> | undefined
+        )?.[option.propertyName];
+
+        const defaultValue = defaultValues?.settings?.[option.propertyName];
 
         return (
-          <Field
+          <OptionField
+            defaultValue={defaultValue}
+            readOnly={readOnly}
             key={key}
-            label={option.label}
-            description={option.description}
-            invalid={!!error}
-            error={error?.message}
-          >
-            {secureFields && secureFields[option.propertyName] ? (
-              <Input
-                readOnly={true}
-                value="Configured"
-                suffix={
-                  <Button
-                    onClick={() => onResetSecureField(option.propertyName)}
-                    variant="link"
-                    type="button"
-                    size="sm"
-                  >
-                    Clear
-                  </Button>
-                }
-              />
-            ) : (
-              <OptionElement pathPrefix={pathPrefix} option={option} />
-            )}
-          </Field>
+            error={error}
+            pathPrefix={pathPrefix}
+            pathSuffix={option.secure ? 'secureSettings.' : 'settings.'}
+            option={option}
+            customValidator={customValidators[option.propertyName]}
+          />
         );
       })}
     </>

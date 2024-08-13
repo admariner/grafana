@@ -1,53 +1,57 @@
-import { css } from '@emotion/css';
-import { GrafanaTheme } from '@grafana/data';
-import { FieldSet, useStyles } from '@grafana/ui';
-import React, { FC } from 'react';
+import { css, cx } from '@emotion/css';
+import React, { ReactElement } from 'react';
+
+import { GrafanaTheme2 } from '@grafana/data';
+import { FieldSet, Text, useStyles2, Stack } from '@grafana/ui';
 
 export interface RuleEditorSectionProps {
   title: string;
   stepNo: number;
-  description?: string;
+  description?: string | ReactElement;
+  fullWidth?: boolean;
 }
 
-export const RuleEditorSection: FC<RuleEditorSectionProps> = ({ title, stepNo, children, description }) => {
-  const styles = useStyles(getStyles);
+export const RuleEditorSection = ({
+  title,
+  stepNo,
+  children,
+  fullWidth = false,
+  description,
+}: React.PropsWithChildren<RuleEditorSectionProps>) => {
+  const styles = useStyles2(getStyles);
 
   return (
     <div className={styles.parent}>
-      <div>
-        <span className={styles.stepNo}>{stepNo}</span>
-      </div>
-      <div className={styles.content}>
-        <FieldSet label={title}>
-          {description && <p className={styles.description}>{description}</p>}
+      <FieldSet
+        className={cx(fullWidth && styles.fullWidth)}
+        label={
+          <Text variant="h3">
+            {stepNo}. {title}
+          </Text>
+        }
+      >
+        <Stack direction="column">
+          {description && <div className={styles.description}>{description}</div>}
           {children}
-        </FieldSet>
-      </div>
+        </Stack>
+      </FieldSet>
     </div>
   );
 };
 
-const getStyles = (theme: GrafanaTheme) => ({
+const getStyles = (theme: GrafanaTheme2) => ({
   parent: css`
     display: flex;
     flex-direction: row;
+    max-width: ${theme.breakpoints.values.xl}px;
+    border: solid 1px ${theme.colors.border.weak};
+    border-radius: ${theme.shape.radius.default};
+    padding: ${theme.spacing(2)} ${theme.spacing(3)};
   `,
   description: css`
-    margin-top: -${theme.spacing.md};
+    margin-top: -${theme.spacing(2)};
   `,
-  stepNo: css`
-    display: inline-block;
-    width: ${theme.spacing.xl};
-    height: ${theme.spacing.xl};
-    line-height: ${theme.spacing.xl};
-    border-radius: ${theme.spacing.md};
-    text-align: center;
-    color: ${theme.colors.textStrong};
-    background-color: ${theme.colors.bg3};
-    font-size: ${theme.typography.size.lg};
-    margin-right: ${theme.spacing.md};
-  `,
-  content: css`
-    flex: 1;
+  fullWidth: css`
+    width: 100%;
   `,
 });

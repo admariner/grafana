@@ -1,18 +1,24 @@
-import { combineLatest, merge, Observable, of, timer } from 'rxjs';
-import { ArrayDataFrame, PanelData } from '@grafana/data';
+import { combineLatest, Observable, of } from 'rxjs';
+import { mergeMap } from 'rxjs/operators';
+
+import { arrayToDataFrame, DataFrame, DataTopic, PanelData } from '@grafana/data';
+
 import { DashboardQueryRunnerResult } from './DashboardQueryRunner/types';
-import { mergeMap, mergeMapTo, takeUntil } from 'rxjs/operators';
+
+function addAnnoDataTopic(annotations: DataFrame[] = []) {
+  annotations.forEach((f) => {
+    f.meta = {
+      ...f.meta,
+      dataTopic: DataTopic.Annotations,
+    };
+  });
+}
 
 export function mergePanelAndDashData(
   panelObservable: Observable<PanelData>,
   dashObservable: Observable<DashboardQueryRunnerResult>
 ): Observable<PanelData> {
-  const slowDashResult: Observable<DashboardQueryRunnerResult> = merge(
-    timer(200).pipe(mergeMapTo(of({ annotations: [], alertState: undefined })), takeUntil(dashObservable)),
-    dashObservable
-  );
-
-  return combineLatest([panelObservable, slowDashResult]).pipe(
+  return combineLatest([panelObservable, dashObservable]).pipe(
     mergeMap((combined) => {
       const [panelData, dashData] = combined;
 
@@ -21,12 +27,15 @@ export function mergePanelAndDashData(
           panelData.annotations = [];
         }
 
-        return of({
-          ...panelData,
-          annotations: panelData.annotations.concat(new ArrayDataFrame(dashData.annotations)),
-          alertState: dashData.alertState,
-        });
+        const annotations = panelData.annotations.concat(arrayToDataFrame(dashData.annotations));
+
+        addAnnoDataTopic(annotations);
+
+        const alertState = dashData.alertState;
+        return of({ ...panelData, annotations, alertState });
       }
+
+      addAnnoDataTopic(panelData.annotations);
 
       return of(panelData);
     })

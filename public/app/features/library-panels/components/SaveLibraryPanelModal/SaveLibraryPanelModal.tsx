@@ -1,28 +1,30 @@
 import React, { useCallback, useState } from 'react';
-import { Button, Icon, Input, Modal, useStyles } from '@grafana/ui';
 import { useAsync, useDebounce } from 'react-use';
-import { usePanelSave } from '../../utils/usePanelSave';
+
+import { Button, Icon, Input, Modal, useStyles2 } from '@grafana/ui';
+
 import { getConnectedDashboards } from '../../state/api';
-import { PanelModelWithLibraryPanel } from '../../types';
 import { getModalStyles } from '../../styles';
+import { PanelModelWithLibraryPanel } from '../../types';
+import { usePanelSave } from '../../utils/usePanelSave';
 
 interface Props {
   panel: PanelModelWithLibraryPanel;
-  folderId: number;
-  isOpen: boolean;
+  folderUid: string;
+  isUnsavedPrompt?: boolean;
   onConfirm: () => void;
   onDismiss: () => void;
   onDiscard: () => void;
 }
 
-export const SaveLibraryPanelModal: React.FC<Props> = ({
+export const SaveLibraryPanelModal = ({
   panel,
-  folderId,
-  isOpen,
+  folderUid,
+  isUnsavedPrompt,
   onDismiss,
   onConfirm,
   onDiscard,
-}) => {
+}: Props) => {
   const [searchString, setSearchString] = useState('');
   const dashState = useAsync(async () => {
     const searchHits = await getConnectedDashboards(panel.libraryPanel.uid);
@@ -49,20 +51,21 @@ export const SaveLibraryPanelModal: React.FC<Props> = ({
   );
 
   const { saveLibraryPanel } = usePanelSave();
-  const styles = useStyles(getModalStyles);
+  const styles = useStyles2(getModalStyles);
   const discardAndClose = useCallback(() => {
     onDiscard();
-    onDismiss();
-  }, [onDiscard, onDismiss]);
+  }, [onDiscard]);
+
+  const title = isUnsavedPrompt ? 'Unsaved library panel changes' : 'Save library panel';
 
   return (
-    <Modal title="Update all panel instances" icon="save" onDismiss={onDismiss} isOpen={isOpen}>
+    <Modal title={title} icon="save" onDismiss={onDismiss} isOpen={true}>
       <div>
         <p className={styles.textInfo}>
           {'This update will affect '}
           <strong>
-            {panel.libraryPanel.meta.connectedDashboards}{' '}
-            {panel.libraryPanel.meta.connectedDashboards === 1 ? 'dashboard' : 'dashboards'}.
+            {panel.libraryPanel.meta?.connectedDashboards}{' '}
+            {panel.libraryPanel.meta?.connectedDashboards === 1 ? 'dashboard' : 'dashboards'}.
           </strong>
           The following dashboards using the panel will be affected:
         </p>
@@ -95,14 +98,15 @@ export const SaveLibraryPanelModal: React.FC<Props> = ({
           <Button variant="secondary" onClick={onDismiss} fill="outline">
             Cancel
           </Button>
-          <Button variant="destructive" onClick={discardAndClose}>
-            Discard
-          </Button>
+          {isUnsavedPrompt && (
+            <Button variant="destructive" onClick={discardAndClose}>
+              Discard
+            </Button>
+          )}
           <Button
             onClick={() => {
-              saveLibraryPanel(panel, folderId).then(() => {
+              saveLibraryPanel(panel, folderUid).then(() => {
                 onConfirm();
-                onDismiss();
               });
             }}
           >

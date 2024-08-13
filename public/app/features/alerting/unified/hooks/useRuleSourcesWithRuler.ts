@@ -1,24 +1,19 @@
 import { DataSourceInstanceSettings } from '@grafana/data';
-import { useEffect, useMemo } from 'react';
-import { useDispatch } from 'react-redux';
-import { fetchRulerRulesIfNotFetchedYet } from '../state/actions';
-import { getAllDataSources } from '../utils/config';
-import { DataSourceType, getRulesDataSources } from '../utils/datasource';
+import { PromBasedDataSource } from 'app/types/unified-alerting';
+
+import { getDataSourceByName } from '../utils/datasource';
+
 import { useUnifiedAlertingSelector } from './useUnifiedAlertingSelector';
 
 export function useRulesSourcesWithRuler(): DataSourceInstanceSettings[] {
-  const rulerRequests = useUnifiedAlertingSelector((state) => state.rulerRules);
-  const dispatch = useDispatch();
+  const dataSources = useUnifiedAlertingSelector((state) => state.dataSources);
 
+  const dataSourcesWithRuler = Object.values(dataSources)
+    .map((ds) => ds.result)
+    .filter((ds): ds is PromBasedDataSource => Boolean(ds?.rulerConfig));
   // try fetching rules for each prometheus to see if it has ruler
-  useEffect(() => {
-    getAllDataSources()
-      .filter((ds) => ds.type === DataSourceType.Prometheus)
-      .forEach((ds) => dispatch(fetchRulerRulesIfNotFetchedYet(ds.name)));
-  }, [dispatch]);
 
-  return useMemo(
-    () => getRulesDataSources().filter((ds) => ds.type === DataSourceType.Loki || !!rulerRequests[ds.name]?.result),
-    [rulerRequests]
-  );
+  return dataSourcesWithRuler
+    .map((ds) => getDataSourceByName(ds.name))
+    .filter((dsConfig): dsConfig is DataSourceInstanceSettings => Boolean(dsConfig));
 }

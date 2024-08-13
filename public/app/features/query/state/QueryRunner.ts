@@ -1,3 +1,7 @@
+import { cloneDeep } from 'lodash';
+import { from, Observable, ReplaySubject, Unsubscribable } from 'rxjs';
+import { first } from 'rxjs/operators';
+
 import {
   CoreApp,
   DataQueryRequest,
@@ -8,16 +12,15 @@ import {
   QueryRunnerOptions,
   QueryRunner as QueryRunnerSrv,
   LoadingState,
-  compareArrayValues,
-  compareDataFrameStructures,
+  DataSourceRef,
+  preProcessPanelData,
 } from '@grafana/data';
 import { getTemplateSrv } from '@grafana/runtime';
 import { getDatasourceSrv } from 'app/features/plugins/datasource_srv';
-import { cloneDeep } from 'lodash';
-import { from, Observable, ReplaySubject, Unsubscribable } from 'rxjs';
-import { first } from 'rxjs/operators';
+
 import { getNextRequestId } from './PanelQueryRunner';
-import { preProcessPanelData, runRequest } from './runRequest';
+import { setStructureRevision } from './processing/revision';
+import { runRequest } from './runRequest';
 
 export class QueryRunner implements QueryRunnerSrv {
   private subject: ReplaySubject<PanelData>;
@@ -39,10 +42,11 @@ export class QueryRunner implements QueryRunnerSrv {
       datasource,
       panelId,
       app,
-      dashboardId,
+      dashboardUID,
       timeRange,
       timeInfo,
       cacheTimeout,
+      queryCachingTTL,
       maxDataPoints,
       scopedVars,
       minInterval,
@@ -57,7 +61,7 @@ export class QueryRunner implements QueryRunnerSrv {
       requestId: getNextRequestId(),
       timezone,
       panelId,
-      dashboardId,
+      dashboardUID,
       range: timeRange,
       timeInfo,
       interval: '',
@@ -66,11 +70,12 @@ export class QueryRunner implements QueryRunnerSrv {
       maxDataPoints: maxDataPoints,
       scopedVars: scopedVars || {},
       cacheTimeout,
+      queryCachingTTL,
       startTime: Date.now(),
     };
 
     // Add deprecated property
-    (request as any).rangeRaw = timeRange.raw;
+    request.rangeRaw = timeRange.raw;
 
     from(getDataSource(datasource, request.scopedVars))
       .pipe(first())
@@ -79,7 +84,7 @@ export class QueryRunner implements QueryRunnerSrv {
           // Attach the datasource name to each query
           request.targets = request.targets.map((query) => {
             if (!query.datasource) {
-              query.datasource = ds.name;
+              query.datasource = ds.getRef();
             }
             return query;
           });
@@ -102,23 +107,7 @@ export class QueryRunner implements QueryRunnerSrv {
           this.subscription = runRequest(ds, request).subscribe({
             next: (data) => {
               const results = preProcessPanelData(data, this.lastResult);
-
-              // Indicate if the structure has changed since the last query
-              let structureRev = 1;
-              if (this.lastResult?.structureRev && this.lastResult.series) {
-                structureRev = this.lastResult.structureRev;
-                const sameStructure = compareArrayValues(
-                  results.series,
-                  this.lastResult.series,
-                  compareDataFrameStructures
-                );
-                if (!sameStructure) {
-                  structureRev++;
-                }
-              }
-              results.structureRev = structureRev;
-              this.lastResult = results;
-
+              this.lastResult = setStructureRevision(results, this.lastResult);
               // Store preprocessed query results for applying overrides later on in the pipeline
               this.subject.next(this.lastResult);
             },
@@ -157,11 +146,12 @@ export class QueryRunner implements QueryRunnerSrv {
 }
 
 async function getDataSource(
-  datasource: string | DataSourceApi | null,
+  datasource: DataSourceRef | DataSourceApi | null,
   scopedVars: ScopedVars
 ): Promise<DataSourceApi> {
-  if (datasource && (datasource as any).query) {
-    return datasource as DataSourceApi;
+  if (datasource && 'query' in datasource) {
+    return datasource;
   }
-  return await getDatasourceSrv().get(datasource as string, scopedVars);
+
+  return getDatasourceSrv().get(datasource, scopedVars);
 }

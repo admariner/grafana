@@ -1,101 +1,37 @@
-import { Field, Alert, LoadingPlaceholder } from '@grafana/ui';
-import React, { FC, useEffect } from 'react';
-import { useDispatch } from 'react-redux';
-import { Redirect, Route, RouteChildrenProps, Switch, useLocation } from 'react-router-dom';
-import { AlertingPageWrapper } from './components/AlertingPageWrapper';
-import { AlertManagerPicker } from './components/AlertManagerPicker';
-import { EditReceiverView } from './components/receivers/EditReceiverView';
-import { EditTemplateView } from './components/receivers/EditTemplateView';
-import { NewReceiverView } from './components/receivers/NewReceiverView';
-import { NewTemplateView } from './components/receivers/NewTemplateView';
-import { ReceiversAndTemplatesView } from './components/receivers/ReceiversAndTemplatesView';
-import { useAlertManagerSourceName } from './hooks/useAlertManagerSourceName';
-import { useUnifiedAlertingSelector } from './hooks/useUnifiedAlertingSelector';
-import { fetchAlertManagerConfigAction, fetchGrafanaNotifiersAction } from './state/actions';
-import { GRAFANA_RULES_SOURCE_NAME } from './utils/datasource';
-import { initialAsyncRequestState } from './utils/redux';
+import React from 'react';
+import { Route, Switch } from 'react-router-dom';
 
-const Receivers: FC = () => {
-  const [alertManagerSourceName, setAlertManagerSourceName] = useAlertManagerSourceName();
-  const dispatch = useDispatch();
+import { withErrorBoundary } from '@grafana/ui';
+const ContactPointsV2 = SafeDynamicImport(() => import('./components/contact-points/ContactPoints'));
+const EditContactPoint = SafeDynamicImport(() => import('./components/contact-points/EditContactPoint'));
+const NewContactPoint = SafeDynamicImport(() => import('./components/contact-points/NewContactPoint'));
+const EditMessageTemplate = SafeDynamicImport(() => import('./components/contact-points/EditMessageTemplate'));
+const NewMessageTemplate = SafeDynamicImport(() => import('./components/contact-points/NewMessageTemplate'));
+const GlobalConfig = SafeDynamicImport(() => import('./components/contact-points/components/GlobalConfig'));
+const DuplicateMessageTemplate = SafeDynamicImport(
+  () => import('./components/contact-points/DuplicateMessageTemplate')
+);
+import { SafeDynamicImport } from 'app/core/components/DynamicImports/SafeDynamicImport';
+import { GrafanaRouteComponentProps } from 'app/core/navigation/types';
 
-  const location = useLocation();
-  const isRoot = location.pathname.endsWith('/alerting/notifications');
+import { AlertmanagerPageWrapper } from './components/AlertingPageWrapper';
 
-  const configRequests = useUnifiedAlertingSelector((state) => state.amConfigs);
+const ContactPoints = (_props: GrafanaRouteComponentProps): JSX.Element => (
+  <AlertmanagerPageWrapper navId="receivers" accessType="notification">
+    <Switch>
+      <Route exact={true} path="/alerting/notifications" component={ContactPointsV2} />
+      <Route exact={true} path="/alerting/notifications/receivers/new" component={NewContactPoint} />
+      <Route exact={true} path="/alerting/notifications/receivers/:name/edit" component={EditContactPoint} />
+      <Route exact={true} path="/alerting/notifications/templates/:name/edit" component={EditMessageTemplate} />
+      <Route exact={true} path="/alerting/notifications/templates/new" component={NewMessageTemplate} />
+      <Route
+        exact={true}
+        path="/alerting/notifications/templates/:name/duplicate"
+        component={DuplicateMessageTemplate}
+      />
+      <Route exact={true} path="/alerting/notifications/global-config" component={GlobalConfig} />
+    </Switch>
+  </AlertmanagerPageWrapper>
+);
 
-  const { result: config, loading, error } =
-    (alertManagerSourceName && configRequests[alertManagerSourceName]) || initialAsyncRequestState;
-  const receiverTypes = useUnifiedAlertingSelector((state) => state.grafanaNotifiers);
-
-  const shouldLoadConfig = isRoot || !config;
-
-  useEffect(() => {
-    if (alertManagerSourceName && shouldLoadConfig) {
-      dispatch(fetchAlertManagerConfigAction(alertManagerSourceName));
-    }
-  }, [alertManagerSourceName, dispatch, shouldLoadConfig]);
-
-  useEffect(() => {
-    if (alertManagerSourceName === GRAFANA_RULES_SOURCE_NAME && !(receiverTypes.result || receiverTypes.loading)) {
-      dispatch(fetchGrafanaNotifiersAction());
-    }
-  }, [alertManagerSourceName, dispatch, receiverTypes]);
-
-  const disableAmSelect = !isRoot;
-
-  if (!alertManagerSourceName) {
-    return <Redirect to="/alerting/notifications" />;
-  }
-
-  return (
-    <AlertingPageWrapper pageId="receivers">
-      <Field label={disableAmSelect ? 'Alert manager' : 'Choose alert manager'} disabled={disableAmSelect}>
-        <AlertManagerPicker current={alertManagerSourceName} onChange={setAlertManagerSourceName} />
-      </Field>
-      {error && !loading && (
-        <Alert severity="error" title="Error loading alert manager config">
-          {error.message || 'Unknown error.'}
-        </Alert>
-      )}
-      {loading && !config && <LoadingPlaceholder text="loading configuration..." />}
-      {config && !error && (
-        <Switch>
-          <Route exact={true} path="/alerting/notifications">
-            <ReceiversAndTemplatesView config={config} alertManagerName={alertManagerSourceName} />
-          </Route>
-          <Route exact={true} path="/alerting/notifications/templates/new">
-            <NewTemplateView config={config} alertManagerSourceName={alertManagerSourceName} />
-          </Route>
-          <Route exact={true} path="/alerting/notifications/templates/:name/edit">
-            {({ match }: RouteChildrenProps<{ name: string }>) =>
-              match?.params.name && (
-                <EditTemplateView
-                  alertManagerSourceName={alertManagerSourceName}
-                  config={config}
-                  templateName={decodeURIComponent(match?.params.name)}
-                />
-              )
-            }
-          </Route>
-          <Route exact={true} path="/alerting/notifications/receivers/new">
-            <NewReceiverView config={config} alertManagerSourceName={alertManagerSourceName} />
-          </Route>
-          <Route exact={true} path="/alerting/notifications/receivers/:name/edit">
-            {({ match }: RouteChildrenProps<{ name: string }>) =>
-              match?.params.name && (
-                <EditReceiverView
-                  alertManagerSourceName={alertManagerSourceName}
-                  config={config}
-                  receiverName={decodeURIComponent(match?.params.name)}
-                />
-              )
-            }
-          </Route>
-        </Switch>
-      )}
-    </AlertingPageWrapper>
-  );
-};
-
-export default Receivers;
+export default withErrorBoundary(ContactPoints, { style: 'page' });

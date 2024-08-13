@@ -1,23 +1,36 @@
+import { Meta, Story } from '@storybook/react';
 import React from 'react';
-import { withCenteredStory } from '../../utils/storybook/withCenteredStory';
-import { withStoryContainer } from '../../utils/storybook/withStoryContainer';
+import { FieldValues } from 'react-hook-form';
+
 import { Form, Input, Button, HorizontalGroup } from '@grafana/ui';
+
+import { withStoryContainer } from '../../utils/storybook/withStoryContainer';
+
 import { FieldArray } from './FieldArray';
 import mdx from './FieldArray.mdx';
 
-export default {
+const meta: Meta = {
   title: 'Forms/FieldArray',
   component: FieldArray,
-  decorators: [withStoryContainer, withCenteredStory],
+  decorators: [withStoryContainer],
   parameters: {
     docs: {
       page: mdx,
     },
+    controls: {
+      exclude: ['name', 'keyName', 'control', 'shouldUnregister'],
+    },
+  },
+  argTypes: {
+    containerWidth: { control: { type: 'range', min: 100, max: 500, step: 10 } },
+    containerHeight: { control: { type: 'range', min: 100, max: 500, step: 10 } },
   },
 };
 
-export const simple = () => {
-  const defaultValues: any = {
+export default meta;
+
+export const Simple: Story = (args) => {
+  const defaultValues: FieldValues = {
     people: [{ firstName: 'Janis', lastName: 'Joplin' }],
   };
   return (
@@ -57,4 +70,9 @@ export const simple = () => {
       )}
     </Form>
   );
+};
+Simple.args = {
+  containerWidth: 300,
+  containerHeight: 0,
+  showBoundaries: false,
 };

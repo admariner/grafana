@@ -1,12 +1,15 @@
-/** @jsxImportSource @emotion/react */
-
+/** @jsxRuntime classic */
+/** @jsx jsx */
+import { css, CSSInterpolation, cx } from '@emotion/css';
+import { jsx } from '@emotion/react';
+import classnames from 'classnames';
 import { Profiler, ProfilerOnRenderCallback, useState, FC } from 'react';
-import { GrafanaThemeV2 } from '@grafana/data';
-import { css, cx } from '@emotion/css';
+
+import { GrafanaTheme2 } from '@grafana/data';
+
 import { useStyles2, useTheme2 } from '../../themes';
 import { Button } from '../Button';
 import { VerticalGroup } from '../Layout/Layout';
-import classnames from 'classnames';
 
 export function EmotionPerfTest() {
   console.log('process.env.NODE_ENV', process.env.NODE_ENV);
@@ -141,7 +144,7 @@ function MeasureRender({ children, id }: { children: React.ReactNode; id: string
   );
 }
 
-const getStyles = (theme: GrafanaThemeV2) => {
+const getStyles = (theme: GrafanaTheme2) => {
   return {
     main: css(getStylesObjectMain(theme)),
     large: css({
@@ -156,7 +159,7 @@ const getStyles = (theme: GrafanaThemeV2) => {
   };
 };
 
-const getStylesObjects = (theme: GrafanaThemeV2) => {
+const getStylesObjects = (theme: GrafanaTheme2) => {
   return {
     main: getStylesObjectMain(theme),
     large: {
@@ -171,7 +174,7 @@ const getStylesObjects = (theme: GrafanaThemeV2) => {
   };
 };
 
-function getStylesObjectMain(theme: GrafanaThemeV2): any {
+function getStylesObjectMain(theme: GrafanaTheme2): CSSInterpolation {
   return {
     background: 'blue',
     border: '1px solid red',
@@ -184,7 +187,7 @@ function getStylesObjectMain(theme: GrafanaThemeV2): any {
   };
 }
 
-function getStylesObjectChild(theme: GrafanaThemeV2): any {
+function getStylesObjectChild(theme: GrafanaTheme2): CSSInterpolation {
   return {
     padding: '2px',
     fontSize: '10px',

@@ -1,63 +1,70 @@
-import React from 'react';
-import { GrafanaTheme, GraphSeriesValue } from '@grafana/data';
 import { css, cx } from '@emotion/css';
+import React from 'react';
+
+import { GrafanaTheme2, GraphSeriesValue } from '@grafana/data';
+
+import { useStyles2 } from '../../themes';
 import { SeriesIcon } from '../VizLegend/SeriesIcon';
-import { useStyles } from '../../themes';
 
 /**
  * @public
  */
 export interface SeriesTableRowProps {
   color?: string;
-  label?: string;
-  value: string | GraphSeriesValue;
+  label?: React.ReactNode;
+  value?: string | GraphSeriesValue;
   isActive?: boolean;
 }
 
-const getSeriesTableRowStyles = (theme: GrafanaTheme) => {
+const getSeriesTableRowStyles = (theme: GrafanaTheme2) => {
   return {
-    icon: css`
-      margin-right: ${theme.spacing.xs};
-      vertical-align: middle;
-    `,
-    seriesTable: css`
-      display: table;
-    `,
-    seriesTableRow: css`
-      display: table-row;
-      font-size: ${theme.typography.size.sm};
-    `,
-    seriesTableCell: css`
-      display: table-cell;
-    `,
-    label: css`
-      word-break: break-all;
-    `,
-    value: css`
-      padding-left: ${theme.spacing.md};
-    `,
-    activeSeries: css`
-      font-weight: ${theme.typography.weight.bold};
-    `,
-    timestamp: css`
-      font-weight: ${theme.typography.weight.bold};
-      font-size: ${theme.typography.size.sm};
-    `,
+    icon: css({
+      marginRight: theme.spacing(1),
+      verticalAlign: 'middle',
+    }),
+    seriesTable: css({
+      display: 'table',
+    }),
+    seriesTableRow: css({
+      display: 'table-row',
+      fontSize: theme.typography.bodySmall.fontSize,
+    }),
+    seriesTableCell: css({
+      display: 'table-cell',
+    }),
+    label: css({
+      wordBreak: 'break-all',
+    }),
+    value: css({
+      paddingLeft: theme.spacing(2),
+      textAlign: 'right',
+    }),
+    activeSeries: css({
+      fontWeight: theme.typography.fontWeightBold,
+      color: theme.colors.text.maxContrast,
+    }),
+    timestamp: css({
+      fontWeight: theme.typography.fontWeightBold,
+      fontSize: theme.typography.bodySmall.fontSize,
+    }),
   };
 };
 
-const SeriesTableRow: React.FC<SeriesTableRowProps> = ({ color, label, value, isActive }) => {
-  const styles = useStyles(getSeriesTableRowStyles);
+/**
+ * @public
+ */
+export const SeriesTableRow = ({ color, label, value, isActive }: SeriesTableRowProps) => {
+  const styles = useStyles2(getSeriesTableRowStyles);
 
   return (
-    <div className={cx(styles.seriesTableRow, isActive && styles.activeSeries)}>
+    <div data-testid="SeriesTableRow" className={cx(styles.seriesTableRow, isActive && styles.activeSeries)}>
       {color && (
         <div className={styles.seriesTableCell}>
           <SeriesIcon color={color} className={styles.icon} />
         </div>
       )}
-      <div className={cx(styles.seriesTableCell, styles.label)}>{label}</div>
-      <div className={cx(styles.seriesTableCell, styles.value)}>{value}</div>
+      {label && <div className={cx(styles.seriesTableCell, styles.label)}>{label}</div>}
+      {value && <div className={cx(styles.seriesTableCell, styles.value)}>{value}</div>}
     </div>
   );
 };
@@ -73,8 +80,8 @@ export interface SeriesTableProps {
 /**
  * @public
  */
-export const SeriesTable: React.FC<SeriesTableProps> = ({ timestamp, series }) => {
-  const styles = useStyles(getSeriesTableRowStyles);
+export const SeriesTable = ({ timestamp, series }: SeriesTableProps) => {
+  const styles = useStyles2(getSeriesTableRowStyles);
 
   return (
     <>

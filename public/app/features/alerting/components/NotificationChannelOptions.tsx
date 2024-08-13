@@ -1,10 +1,14 @@
-import React, { FC } from 'react';
+import React from 'react';
+
 import { SelectableValue } from '@grafana/data';
-import { Button, Checkbox, Field, FormAPI, Input } from '@grafana/ui';
-import { OptionElement } from './OptionElement';
+import { Button, Checkbox, Field, Input } from '@grafana/ui';
+
 import { NotificationChannelDTO, NotificationChannelOption, NotificationChannelSecureFields } from '../../../types';
 
-interface Props extends Omit<FormAPI<NotificationChannelDTO>, 'formState' | 'getValues' | 'watch' | 'setValue'> {
+import { NotificationSettingsProps } from './NotificationChannelForm';
+import { OptionElement } from './OptionElement';
+
+interface Props extends NotificationSettingsProps {
   selectedChannelOptions: NotificationChannelOption[];
   currentFormValues: NotificationChannelDTO;
   secureFields: NotificationChannelSecureFields;
@@ -12,7 +16,7 @@ interface Props extends Omit<FormAPI<NotificationChannelDTO>, 'formState' | 'get
   onResetSecureField: (key: string) => void;
 }
 
-export const NotificationChannelOptions: FC<Props> = ({
+export const NotificationChannelOptions = ({
   control,
   currentFormValues,
   errors,
@@ -20,7 +24,7 @@ export const NotificationChannelOptions: FC<Props> = ({
   register,
   onResetSecureField,
   secureFields,
-}) => {
+}: Props) => {
   return (
     <>
       {selectedChannelOptions.map((option: NotificationChannelOption, index: number) => {
@@ -54,7 +58,7 @@ export const NotificationChannelOptions: FC<Props> = ({
             label={option.label}
             description={option.description}
             invalid={errors.settings && !!errors.settings[option.propertyName]}
-            error={errors.settings && errors.settings[option.propertyName]?.message}
+            error={errors.settings && String(errors.settings[option.propertyName]?.message || '')}
           >
             {secureFields && secureFields[option.propertyName] ? (
               <Input

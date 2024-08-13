@@ -2,10 +2,12 @@ package alerting
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -14,25 +16,402 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/grafana/pkg/components/simplejson"
-	"github.com/grafana/grafana/pkg/models"
+	"github.com/grafana/grafana/pkg/expr"
+	"github.com/grafana/grafana/pkg/util/errutil"
+
 	apimodels "github.com/grafana/grafana/pkg/services/ngalert/api/tooling/definitions"
 	ngmodels "github.com/grafana/grafana/pkg/services/ngalert/models"
 	ngstore "github.com/grafana/grafana/pkg/services/ngalert/store"
+	"github.com/grafana/grafana/pkg/services/org"
+	"github.com/grafana/grafana/pkg/services/org/orgimpl"
+	"github.com/grafana/grafana/pkg/services/quota/quotaimpl"
 	"github.com/grafana/grafana/pkg/services/sqlstore"
+	"github.com/grafana/grafana/pkg/services/supportbundles/supportbundlestest"
+	"github.com/grafana/grafana/pkg/services/user"
+	"github.com/grafana/grafana/pkg/services/user/userimpl"
+	"github.com/grafana/grafana/pkg/setting"
 	"github.com/grafana/grafana/pkg/tests/testinfra"
 )
 
-func TestAlertAndGroupsQuery(t *testing.T) {
+type Response struct {
+	Message string `json:"message"`
+	TraceID string `json:"traceID"`
+}
+
+func TestIntegrationAMConfigAccess(t *testing.T) {
+	testinfra.SQLiteIntegrationTest(t)
+
 	dir, path := testinfra.CreateGrafDir(t, testinfra.GrafanaOpts{
-		EnableFeatureToggles: []string{"ngalert"},
-		AnonymousUserRole:    models.ROLE_EDITOR,
+		DisableLegacyAlerting: true,
+		EnableUnifiedAlerting: true,
+		DisableAnonymous:      true,
+		AppModeProduction:     true,
 	})
 
-	store := testinfra.SetUpDatabase(t, dir)
-	grafanaListedAddr := testinfra.StartGrafana(t, dir, path, store)
+	grafanaListedAddr, store := testinfra.StartGrafana(t, dir, path)
 
-	// When there are no alerts available, it returns an empty list.
+	// Create a users to make authenticated requests
+	createUser(t, store, user.CreateUserCommand{
+		DefaultOrgRole: string(org.RoleViewer),
+		Password:       "viewer",
+		Login:          "viewer",
+	})
+	createUser(t, store, user.CreateUserCommand{
+		DefaultOrgRole: string(org.RoleEditor),
+		Password:       "editor",
+		Login:          "editor",
+	})
+	createUser(t, store, user.CreateUserCommand{
+		DefaultOrgRole: string(org.RoleAdmin),
+		Password:       "admin",
+		Login:          "admin",
+	})
+
+	type testCase struct {
+		desc      string
+		url       string
+		expStatus int
+		expBody   string
+	}
+
+	t.Run("when creating alertmanager configuration", func(t *testing.T) {
+		body := `
+		{
+			"alertmanager_config": {
+				"route": {
+					"receiver": "grafana-default-email"
+				},
+				"receivers": [{
+					"name": "grafana-default-email",
+					"grafana_managed_receiver_configs": [{
+						"uid": "",
+						"name": "email receiver",
+						"type": "email",
+						"isDefault": true,
+						"settings": {
+							"addresses": "<example@email.com>"
+						}
+					}]
+				}]
+			}
+		}
+		`
+
+		testCases := []testCase{
+			{
+				desc:      "un-authenticated request should fail",
+				url:       "http://%s/api/alertmanager/grafana/config/api/v1/alerts",
+				expStatus: http.StatusUnauthorized,
+				expBody:   `"message":"Unauthorized"`,
+			},
+			{
+				desc:      "viewer request should fail",
+				url:       "http://viewer:viewer@%s/api/alertmanager/grafana/config/api/v1/alerts",
+				expStatus: http.StatusForbidden,
+				expBody:   `"title":"Access denied"`,
+			},
+			{
+				desc:      "editor request should succeed",
+				url:       "http://editor:editor@%s/api/alertmanager/grafana/config/api/v1/alerts",
+				expStatus: http.StatusAccepted,
+				expBody:   `{"message":"configuration created"}`,
+			},
+			{
+				desc:      "admin request should succeed",
+				url:       "http://admin:admin@%s/api/alertmanager/grafana/config/api/v1/alerts",
+				expStatus: http.StatusAccepted,
+				expBody:   `{"message":"configuration created"}`,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.desc, func(t *testing.T) {
+				url := fmt.Sprintf(tc.url, grafanaListedAddr)
+				buf := bytes.NewReader([]byte(body))
+				// nolint:gosec
+				resp, err := http.Post(url, "application/json", buf)
+				t.Cleanup(func() {
+					require.NoError(t, resp.Body.Close())
+				})
+				require.NoError(t, err)
+				require.Equal(t, tc.expStatus, resp.StatusCode)
+				b, err := io.ReadAll(resp.Body)
+				require.NoError(t, err)
+				require.Contains(t, string(b), tc.expBody)
+			})
+		}
+	})
+
+	t.Run("when retrieve alertmanager configuration", func(t *testing.T) {
+		cfgBody := `
+		{
+			"template_files": null,
+			"alertmanager_config": {
+				"route": {
+					"receiver": "grafana-default-email"
+				},
+				"templates": null,
+				"receivers": [{
+					"name": "grafana-default-email",
+					"grafana_managed_receiver_configs": [{
+						"disableResolveMessage": false,
+						"uid": "",
+						"name": "email receiver",
+						"type": "email",
+						"secureFields": {},
+						"settings": {
+							"addresses": "<example@email.com>"
+						}
+					}]
+				}]
+			}
+		}
+		`
+		testCases := []testCase{
+			{
+				desc:      "un-authenticated request should fail",
+				url:       "http://%s/api/alertmanager/grafana/config/api/v1/alerts",
+				expStatus: http.StatusUnauthorized,
+				expBody:   `{"extra":null,"message":"Unauthorized","messageId":"auth.unauthorized","statusCode":401,"traceID":""}`,
+			},
+			{
+				desc:      "viewer request should succeed",
+				url:       "http://viewer:viewer@%s/api/alertmanager/grafana/config/api/v1/alerts",
+				expStatus: http.StatusOK,
+				expBody:   cfgBody,
+			},
+			{
+				desc:      "editor request should succeed",
+				url:       "http://editor:editor@%s/api/alertmanager/grafana/config/api/v1/alerts",
+				expStatus: http.StatusOK,
+				expBody:   cfgBody,
+			},
+			{
+				desc:      "admin request should succeed",
+				url:       "http://admin:admin@%s/api/alertmanager/grafana/config/api/v1/alerts",
+				expStatus: http.StatusOK,
+				expBody:   cfgBody,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.desc, func(t *testing.T) {
+				resp, err := http.Get(fmt.Sprintf(tc.url, grafanaListedAddr))
+				t.Cleanup(func() {
+					require.NoError(t, resp.Body.Close())
+				})
+				require.NoError(t, err)
+				require.Equal(t, tc.expStatus, resp.StatusCode)
+				b, err := io.ReadAll(resp.Body)
+				if tc.expStatus == http.StatusOK {
+					re := regexp.MustCompile(`"uid":"([\w|-]+)"`)
+					b = re.ReplaceAll(b, []byte(`"uid":""`))
+				}
+				require.NoError(t, err)
+				require.JSONEq(t, tc.expBody, string(b))
+			})
+		}
+	})
+
+	t.Run("when creating silence", func(t *testing.T) {
+		now := time.Now()
+		body := fmt.Sprintf(`
+		{
+			"comment": "string",
+			"createdBy": "string",
+			"matchers": [
+			  {
+				"isRegex": true,
+				"name": "string",
+				"value": "string"
+			  }
+			],
+			"startsAt": "%s",
+			"endsAt": "%s"
+		  }
+		`, now.Format(time.RFC3339), now.Add(10*time.Second).Format(time.RFC3339))
+
+		testCases := []testCase{
+			{
+				desc:      "un-authenticated request should fail",
+				url:       "http://%s/api/alertmanager/grafana/config/api/v2/silences",
+				expStatus: http.StatusUnauthorized,
+				expBody:   `"message":"Unauthorized"`,
+			},
+			{
+				desc:      "viewer request should fail",
+				url:       "http://viewer:viewer@%s/api/alertmanager/grafana/api/v2/silences",
+				expStatus: http.StatusForbidden,
+				expBody:   `"title":"Access denied"`,
+			},
+			{
+				desc:      "editor request should succeed",
+				url:       "http://editor:editor@%s/api/alertmanager/grafana/api/v2/silences",
+				expStatus: http.StatusAccepted,
+			},
+			{
+				desc:      "admin request should succeed",
+				url:       "http://admin:admin@%s/api/alertmanager/grafana/api/v2/silences",
+				expStatus: http.StatusAccepted,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.desc, func(t *testing.T) {
+				url := fmt.Sprintf(tc.url, grafanaListedAddr)
+				buf := bytes.NewReader([]byte(body))
+				// nolint:gosec
+				resp, err := http.Post(url, "application/json", buf)
+				t.Cleanup(func() {
+					require.NoError(t, resp.Body.Close())
+				})
+				require.NoError(t, err)
+				require.Equal(t, tc.expStatus, resp.StatusCode)
+				b, err := io.ReadAll(resp.Body)
+				require.NoError(t, err)
+				if tc.expStatus == http.StatusAccepted {
+					response := apimodels.PostSilencesOKBody{}
+					require.NoError(t, json.Unmarshal(b, &response))
+					require.NotEmpty(t, response.SilenceID)
+					return
+				}
+				require.Contains(t, string(b), tc.expBody)
+			})
+		}
+	})
+
+	var blob []byte
+	t.Run("when getting silences", func(t *testing.T) {
+		testCases := []testCase{
+			{
+				desc:      "un-authenticated request should fail",
+				url:       "http://%s/api/alertmanager/grafana/api/v2/silences",
+				expStatus: http.StatusUnauthorized,
+				expBody:   `"message": "Unauthorized"`,
+			},
+			{
+				desc:      "viewer request should succeed",
+				url:       "http://viewer:viewer@%s/api/alertmanager/grafana/api/v2/silences",
+				expStatus: http.StatusOK,
+			},
+			{
+				desc:      "editor request should succeed",
+				url:       "http://editor:editor@%s/api/alertmanager/grafana/api/v2/silences",
+				expStatus: http.StatusOK,
+			},
+			{
+				desc:      "admin request should succeed",
+				url:       "http://admin:admin@%s/api/alertmanager/grafana/api/v2/silences",
+				expStatus: http.StatusOK,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.desc, func(t *testing.T) {
+				url := fmt.Sprintf(tc.url, grafanaListedAddr)
+				// nolint:gosec
+				resp, err := http.Get(url)
+				t.Cleanup(func() {
+					require.NoError(t, resp.Body.Close())
+				})
+				require.NoError(t, err)
+				require.Equal(t, tc.expStatus, resp.StatusCode)
+				require.NoError(t, err)
+				if tc.expStatus == http.StatusOK {
+					b, err := io.ReadAll(resp.Body)
+					require.NoError(t, err)
+					blob = b
+				}
+			})
+		}
+	})
+
+	var silences apimodels.GettableSilences
+	err := json.Unmarshal(blob, &silences)
+	require.NoError(t, err)
+	assert.Len(t, silences, 2)
+	silenceIDs := make([]string, 0, len(silences))
+	for _, s := range silences {
+		silenceIDs = append(silenceIDs, *s.ID)
+	}
+
+	unconsumedSilenceIdx := 0
+	t.Run("when deleting a silence", func(t *testing.T) {
+		testCases := []testCase{
+			{
+				desc:      "un-authenticated request should fail",
+				url:       "http://%s/api/alertmanager/grafana/api/v2/silence/%s",
+				expStatus: http.StatusUnauthorized,
+				expBody:   `"message":"Unauthorized"`,
+			},
+			{
+				desc:      "viewer request should fail",
+				url:       "http://viewer:viewer@%s/api/alertmanager/grafana/api/v2/silence/%s",
+				expStatus: http.StatusForbidden,
+				expBody:   `"title":"Access denied"`,
+			},
+			{
+				desc:      "editor request should succeed",
+				url:       "http://editor:editor@%s/api/alertmanager/grafana/api/v2/silence/%s",
+				expStatus: http.StatusOK,
+				expBody:   `{"message":"silence deleted"}`,
+			},
+			{
+				desc:      "admin request should succeed",
+				url:       "http://admin:admin@%s/api/alertmanager/grafana/api/v2/silence/%s",
+				expStatus: http.StatusOK,
+				expBody:   `{"message":"silence deleted"}`,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.desc, func(t *testing.T) {
+				url := fmt.Sprintf(tc.url, grafanaListedAddr, silenceIDs[unconsumedSilenceIdx])
+
+				// Create client
+				client := &http.Client{}
+
+				// Create request
+				req, err := http.NewRequest("DELETE", url, nil)
+				if err != nil {
+					fmt.Println(err)
+					return
+				}
+
+				// Fetch Request
+				resp, err := client.Do(req)
+				if err != nil {
+					return
+				}
+				t.Cleanup(func() {
+					require.NoError(t, resp.Body.Close())
+				})
+				require.NoError(t, err)
+				require.Equal(t, tc.expStatus, resp.StatusCode)
+				b, err := io.ReadAll(resp.Body)
+				require.NoError(t, err)
+				if tc.expStatus == http.StatusOK {
+					unconsumedSilenceIdx++
+				}
+				require.Contains(t, string(b), tc.expBody)
+			})
+		}
+	})
+}
+
+func TestIntegrationAlertAndGroupsQuery(t *testing.T) {
+	testinfra.SQLiteIntegrationTest(t)
+
+	dir, path := testinfra.CreateGrafDir(t, testinfra.GrafanaOpts{
+		DisableLegacyAlerting: true,
+		EnableUnifiedAlerting: true,
+		DisableAnonymous:      true,
+		AppModeProduction:     true,
+	})
+
+	grafanaListedAddr, store := testinfra.StartGrafana(t, dir, path)
+
+	// unauthenticated request to get the alerts should fail
 	{
 		alertsURL := fmt.Sprintf("http://%s/api/alertmanager/grafana/api/v2/alerts", grafanaListedAddr)
 		// nolint:gosec
@@ -42,15 +421,24 @@ func TestAlertAndGroupsQuery(t *testing.T) {
 			err := resp.Body.Close()
 			require.NoError(t, err)
 		})
-		b, err := ioutil.ReadAll(resp.Body)
+		b, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
-		require.Equal(t, 200, resp.StatusCode)
-		require.JSONEq(t, "[]", string(b))
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+		require.Contains(t, string(b), `"message":"Unauthorized"`)
 	}
 
-	// When are there no alerts available, it returns an empty list of groups.
+	// Create a user to make authenticated requests
+	createUser(t, store, user.CreateUserCommand{
+		DefaultOrgRole: string(org.RoleEditor),
+		Password:       "password",
+		Login:          "grafana",
+	})
+
+	apiClient := newAlertingApiClient(grafanaListedAddr, "grafana", "password")
+
+	// invalid credentials request to get the alerts should fail
 	{
-		alertsURL := fmt.Sprintf("http://%s/api/alertmanager/grafana/api/v2/alerts/groups", grafanaListedAddr)
+		alertsURL := fmt.Sprintf("http://grafana:invalid@%s/api/alertmanager/grafana/api/v2/alerts", grafanaListedAddr)
 		// nolint:gosec
 		resp, err := http.Get(alertsURL)
 		require.NoError(t, err)
@@ -58,7 +446,42 @@ func TestAlertAndGroupsQuery(t *testing.T) {
 			err := resp.Body.Close()
 			require.NoError(t, err)
 		})
-		b, err := ioutil.ReadAll(resp.Body)
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+
+		var res map[string]any
+		require.NoError(t, json.Unmarshal(b, &res))
+		assert.Equal(t, "Invalid username or password", res["message"])
+	}
+
+	// When there are no alerts available, it returns an empty list.
+	{
+		alertsURL := fmt.Sprintf("http://grafana:password@%s/api/alertmanager/grafana/api/v2/alerts", grafanaListedAddr)
+		// nolint:gosec
+		resp, err := http.Get(alertsURL)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			err := resp.Body.Close()
+			require.NoError(t, err)
+		})
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Equal(t, 200, resp.StatusCode)
+		require.JSONEq(t, "[]", string(b))
+	}
+
+	// When are there no alerts available, it returns an empty list of groups.
+	{
+		alertsURL := fmt.Sprintf("http://grafana:password@%s/api/alertmanager/grafana/api/v2/alerts/groups", grafanaListedAddr)
+		// nolint:gosec
+		resp, err := http.Get(alertsURL)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			err := resp.Body.Close()
+			require.NoError(t, err)
+		})
+		b, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.NoError(t, err)
 		require.Equal(t, 200, resp.StatusCode)
@@ -68,7 +491,7 @@ func TestAlertAndGroupsQuery(t *testing.T) {
 	// Now, let's test the endpoint with some alerts.
 	{
 		// Create the namespace we'll save our alerts to.
-		require.NoError(t, createFolder(t, store, 0, "default"))
+		apiClient.CreateFolder(t, "default", "default")
 	}
 
 	// Create an alert that will fire as quickly as possible
@@ -83,14 +506,14 @@ func TestAlertAndGroupsQuery(t *testing.T) {
 					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
 						Title:     "AlwaysFiring",
 						Condition: "A",
-						Data: []ngmodels.AlertQuery{
+						Data: []apimodels.AlertQuery{
 							{
 								RefID: "A",
-								RelativeTimeRange: ngmodels.RelativeTimeRange{
-									From: ngmodels.Duration(time.Duration(5) * time.Hour),
-									To:   ngmodels.Duration(time.Duration(3) * time.Hour),
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
 								},
-								DatasourceUID: "-100",
+								DatasourceUID: expr.DatasourceUID,
 								Model: json.RawMessage(`{
 									"type": "math",
 									"expression": "2 + 3 > 1"
@@ -101,25 +524,14 @@ func TestAlertAndGroupsQuery(t *testing.T) {
 				},
 			},
 		}
-		buf := bytes.Buffer{}
-		enc := json.NewEncoder(&buf)
-		err = enc.Encode(&rules)
-		require.NoError(t, err)
 
-		u := fmt.Sprintf("http://%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
-		// nolint:gosec
-		resp, err := http.Post(u, "application/json", &buf)
-		t.Cleanup(func() {
-			err := resp.Body.Close()
-			require.NoError(t, err)
-		})
-		require.NoError(t, err)
-		assert.Equal(t, resp.StatusCode, 202)
+		_, status, _ := apiClient.PostRulesGroupWithStatus(t, "default", &rules)
+		assert.Equal(t, http.StatusAccepted, status)
 	}
 
 	// Eventually, we'll get an alert with its state being active.
 	{
-		alertsURL := fmt.Sprintf("http://%s/api/alertmanager/grafana/api/v2/alerts", grafanaListedAddr)
+		alertsURL := fmt.Sprintf("http://grafana:password@%s/api/alertmanager/grafana/api/v2/alerts", grafanaListedAddr)
 		// nolint:gosec
 		require.Eventually(t, func() bool {
 			resp, err := http.Get(alertsURL)
@@ -128,7 +540,7 @@ func TestAlertAndGroupsQuery(t *testing.T) {
 				err := resp.Body.Close()
 				require.NoError(t, err)
 			})
-			b, err := ioutil.ReadAll(resp.Body)
+			b, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 			require.Equal(t, 200, resp.StatusCode)
 
@@ -146,17 +558,312 @@ func TestAlertAndGroupsQuery(t *testing.T) {
 	}
 }
 
-func TestAlertRuleCRUD(t *testing.T) {
+func TestIntegrationRulerAccess(t *testing.T) {
+	testinfra.SQLiteIntegrationTest(t)
+
 	// Setup Grafana and its Database
 	dir, path := testinfra.CreateGrafDir(t, testinfra.GrafanaOpts{
-		EnableFeatureToggles: []string{"ngalert"},
-		AnonymousUserRole:    models.ROLE_EDITOR,
+		DisableLegacyAlerting: true,
+		EnableUnifiedAlerting: true,
+		EnableQuota:           true,
+		DisableAnonymous:      true,
+		ViewersCanEdit:        true,
+		AppModeProduction:     true,
 	})
-	store := testinfra.SetUpDatabase(t, dir)
-	grafanaListedAddr := testinfra.StartGrafana(t, dir, path, store)
+
+	grafanaListedAddr, store := testinfra.StartGrafana(t, dir, path)
+
+	// Create a users to make authenticated requests
+	createUser(t, store, user.CreateUserCommand{
+		DefaultOrgRole: string(org.RoleViewer),
+		Password:       "viewer",
+		Login:          "viewer",
+	})
+	createUser(t, store, user.CreateUserCommand{
+		DefaultOrgRole: string(org.RoleEditor),
+		Password:       "editor",
+		Login:          "editor",
+	})
+	createUser(t, store, user.CreateUserCommand{
+		DefaultOrgRole: string(org.RoleAdmin),
+		Password:       "admin",
+		Login:          "admin",
+	})
+
+	client := newAlertingApiClient(grafanaListedAddr, "editor", "editor")
 
 	// Create the namespace we'll save our alerts to.
-	require.NoError(t, createFolder(t, store, 0, "default"))
+	client.CreateFolder(t, "default", "default")
+
+	// Now, let's test the access policies.
+	testCases := []struct {
+		desc            string
+		client          apiClient
+		expStatus       int
+		expectedMessage string
+	}{
+		{
+			desc:            "un-authenticated request should fail",
+			client:          newAlertingApiClient(grafanaListedAddr, "", ""),
+			expStatus:       http.StatusUnauthorized,
+			expectedMessage: `Unauthorized`,
+		},
+		{
+			desc:            "viewer request should fail",
+			client:          newAlertingApiClient(grafanaListedAddr, "viewer", "viewer"),
+			expStatus:       http.StatusForbidden,
+			expectedMessage: `You'll need additional permissions to perform this action. Permissions needed: any of alert.rules:write, alert.rules:create, alert.rules:delete`,
+		},
+		{
+			desc:            "editor request should succeed",
+			client:          newAlertingApiClient(grafanaListedAddr, "editor", "editor"),
+			expStatus:       http.StatusAccepted,
+			expectedMessage: `rule group updated successfully`,
+		},
+		{
+			desc:            "admin request should succeed",
+			client:          newAlertingApiClient(grafanaListedAddr, "admin", "admin"),
+			expStatus:       http.StatusAccepted,
+			expectedMessage: `rule group updated successfully`,
+		},
+	}
+
+	for i, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			interval, err := model.ParseDuration("1m")
+			require.NoError(t, err)
+
+			rules := apimodels.PostableRuleGroupConfig{
+				Name: "arulegroup",
+				Rules: []apimodels.PostableExtendedRuleNode{
+					{
+						ApiRuleNode: &apimodels.ApiRuleNode{
+							For:         &interval,
+							Labels:      map[string]string{"label1": "val1"},
+							Annotations: map[string]string{"annotation1": "val1"},
+						},
+						// this rule does not explicitly set no data and error states
+						// therefore it should get the default values
+						GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
+							Title:     fmt.Sprintf("AlwaysFiring %d", i),
+							Condition: "A",
+							Data: []apimodels.AlertQuery{
+								{
+									RefID: "A",
+									RelativeTimeRange: apimodels.RelativeTimeRange{
+										From: apimodels.Duration(time.Duration(5) * time.Hour),
+										To:   apimodels.Duration(time.Duration(3) * time.Hour),
+									},
+									DatasourceUID: expr.DatasourceUID,
+									Model: json.RawMessage(`{
+								"type": "math",
+								"expression": "2 + 3 > 1"
+								}`),
+								},
+							},
+						},
+					},
+				},
+			}
+			_, status, body := tc.client.PostRulesGroupWithStatus(t, "default", &rules)
+			assert.Equal(t, tc.expStatus, status)
+			res := &Response{}
+			err = json.Unmarshal([]byte(body), &res)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedMessage, res.Message)
+		})
+	}
+}
+
+func TestIntegrationDeleteFolderWithRules(t *testing.T) {
+	testinfra.SQLiteIntegrationTest(t)
+
+	// Setup Grafana and its Database
+	dir, path := testinfra.CreateGrafDir(t, testinfra.GrafanaOpts{
+		DisableLegacyAlerting: true,
+		EnableUnifiedAlerting: true,
+		EnableQuota:           true,
+		DisableAnonymous:      true,
+		ViewersCanEdit:        true,
+		AppModeProduction:     true,
+	})
+
+	grafanaListedAddr, store := testinfra.StartGrafana(t, dir, path)
+
+	createUser(t, store, user.CreateUserCommand{
+		DefaultOrgRole: string(org.RoleViewer),
+		Password:       "viewer",
+		Login:          "viewer",
+	})
+	createUser(t, store, user.CreateUserCommand{
+		DefaultOrgRole: string(org.RoleEditor),
+		Password:       "editor",
+		Login:          "editor",
+	})
+
+	apiClient := newAlertingApiClient(grafanaListedAddr, "editor", "editor")
+
+	// Create the namespace we'll save our alerts to.
+	namespaceUID := "default"
+	apiClient.CreateFolder(t, namespaceUID, namespaceUID)
+
+	createRule(t, apiClient, "default")
+
+	// First, let's have an editor create a rule within the folder/namespace.
+	{
+		u := fmt.Sprintf("http://editor:editor@%s/api/ruler/grafana/api/v1/rules", grafanaListedAddr)
+		// nolint:gosec
+		resp, err := http.Get(u)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			err := resp.Body.Close()
+			require.NoError(t, err)
+		})
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+
+		assert.Equal(t, 200, resp.StatusCode)
+
+		re := regexp.MustCompile(`"uid":"([\w|-]+)"`)
+		b = re.ReplaceAll(b, []byte(`"uid":""`))
+		re = regexp.MustCompile(`"updated":"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)"`)
+		b = re.ReplaceAll(b, []byte(`"updated":"2021-05-19T19:47:55Z"`))
+
+		expectedGetRulesResponseBody := fmt.Sprintf(`{
+			"default": [
+				{
+					"name": "arulegroup",
+					"interval": "1m",
+					"rules": [
+						{
+							"expr": "",
+							"for": "2m",
+							"labels": {
+								"label1": "val1"
+							},
+							"annotations": {
+								"annotation1": "val1"
+							},
+							"grafana_alert": {
+								"id": 1,
+								"orgId": 1,
+								"title": "rule under folder default",
+								"condition": "A",
+								"data": [
+									{
+										"refId": "A",
+										"queryType": "",
+										"relativeTimeRange": {
+											"from": 18000,
+											"to": 10800
+										},
+										"datasourceUid": "__expr__",
+										"model": {
+											"expression": "2 + 3 > 1",
+											"intervalMs": 1000,
+											"maxDataPoints": 43200,
+											"type": "math"
+										}
+									}
+								],
+								"updated": "2021-05-19T19:47:55Z",
+								"intervalSeconds": 60,
+								"is_paused": false,
+								"version": 1,
+								"uid": "",
+								"namespace_uid": %q,
+								"rule_group": "arulegroup",
+								"no_data_state": "NoData",
+								"exec_err_state": "Alerting"
+							}
+						}
+					]
+				}
+			]
+		}`, namespaceUID)
+		assert.JSONEq(t, expectedGetRulesResponseBody, string(b))
+	}
+
+	// Next, the editor can not delete the folder because it contains Grafana 8 alerts.
+	{
+		u := fmt.Sprintf("http://editor:editor@%s/api/folders/%s", grafanaListedAddr, namespaceUID)
+		req, err := http.NewRequest(http.MethodDelete, u, nil)
+		require.NoError(t, err)
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			err := resp.Body.Close()
+			require.NoError(t, err)
+		})
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		var errutilErr errutil.PublicError
+		err = json.Unmarshal(b, &errutilErr)
+		require.NoError(t, err)
+		assert.Equal(t, "Folder cannot be deleted: folder is not empty", errutilErr.Message)
+	}
+
+	// Next, the editor can delete the folder if forceDeleteRules is true.
+	{
+		u := fmt.Sprintf("http://editor:editor@%s/api/folders/%s?forceDeleteRules=true", grafanaListedAddr, namespaceUID)
+		req, err := http.NewRequest(http.MethodDelete, u, nil)
+		require.NoError(t, err)
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			err := resp.Body.Close()
+			require.NoError(t, err)
+		})
+		_, err = io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Equal(t, 200, resp.StatusCode)
+	}
+
+	// Finally, we ensure the rules were deleted.
+	{
+		u := fmt.Sprintf("http://editor:editor@%s/api/ruler/grafana/api/v1/rules", grafanaListedAddr)
+		// nolint:gosec
+		resp, err := http.Get(u)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			err := resp.Body.Close()
+			require.NoError(t, err)
+		})
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+
+		assert.Equal(t, 200, resp.StatusCode)
+		assert.JSONEq(t, "{}", string(b))
+	}
+}
+
+func TestIntegrationAlertRuleCRUD(t *testing.T) {
+	testinfra.SQLiteIntegrationTest(t)
+
+	// Setup Grafana and its Database
+	dir, path := testinfra.CreateGrafDir(t, testinfra.GrafanaOpts{
+		DisableLegacyAlerting: true,
+		EnableUnifiedAlerting: true,
+		EnableQuota:           true,
+		DisableAnonymous:      true,
+		AppModeProduction:     true,
+	})
+
+	grafanaListedAddr, store := testinfra.StartGrafana(t, dir, path)
+
+	createUser(t, store, user.CreateUserCommand{
+		DefaultOrgRole: string(org.RoleEditor),
+		Password:       "password",
+		Login:          "grafana",
+	})
+
+	apiClient := newAlertingApiClient(grafanaListedAddr, "grafana", "password")
+
+	// Create the namespace we'll save our alerts to.
+	apiClient.CreateFolder(t, "default", "default")
 
 	interval, err := model.ParseDuration("1m")
 	require.NoError(t, err)
@@ -167,48 +874,49 @@ func TestAlertRuleCRUD(t *testing.T) {
 	// Now, let's try to create some invalid alert rules.
 	{
 		testCases := []struct {
-			desc             string
-			rulegroup        string
-			interval         model.Duration
-			rule             apimodels.PostableExtendedRuleNode
-			expectedResponse string
+			desc            string
+			rulegroup       string
+			interval        model.Duration
+			rule            apimodels.PostableExtendedRuleNode
+			expectedCode    int
+			expectedMessage string
 		}{
 			{
 				desc:      "alert rule without queries and expressions",
 				rulegroup: "arulegroup",
 				rule: apimodels.PostableExtendedRuleNode{
 					ApiRuleNode: &apimodels.ApiRuleNode{
-						For:         interval,
+						For:         &interval,
 						Labels:      map[string]string{"label1": "val1"},
 						Annotations: map[string]string{"annotation1": "val1"},
 					},
 					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
 						Title: "AlwaysFiring",
-						Data:  []ngmodels.AlertQuery{},
+						Data:  []apimodels.AlertQuery{},
 					},
 				},
-				expectedResponse: `{"error":"invalid alert rule: no queries or expressions are found", "message":"failed to update rule group"}`,
+				expectedMessage: "invalid rule specification at index [0]: invalid alert rule: no queries or expressions are found",
 			},
 			{
 				desc:      "alert rule with empty title",
 				rulegroup: "arulegroup",
 				rule: apimodels.PostableExtendedRuleNode{
 					ApiRuleNode: &apimodels.ApiRuleNode{
-						For:         interval,
+						For:         &interval,
 						Labels:      map[string]string{"label1": "val1"},
 						Annotations: map[string]string{"annotation1": "val1"},
 					},
 					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
 						Title:     "",
 						Condition: "A",
-						Data: []ngmodels.AlertQuery{
+						Data: []apimodels.AlertQuery{
 							{
 								RefID: "A",
-								RelativeTimeRange: ngmodels.RelativeTimeRange{
-									From: ngmodels.Duration(time.Duration(5) * time.Hour),
-									To:   ngmodels.Duration(time.Duration(3) * time.Hour),
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
 								},
-								DatasourceUID: "-100",
+								DatasourceUID: expr.DatasourceUID,
 								Model: json.RawMessage(`{
 									"type": "math",
 									"expression": "2 + 3 > 1"
@@ -217,28 +925,28 @@ func TestAlertRuleCRUD(t *testing.T) {
 						},
 					},
 				},
-				expectedResponse: `{"error":"invalid alert rule: title is empty", "message":"failed to update rule group"}`,
+				expectedMessage: "invalid rule specification at index [0]: alert rule title cannot be empty",
 			},
 			{
 				desc:      "alert rule with too long name",
 				rulegroup: "arulegroup",
 				rule: apimodels.PostableExtendedRuleNode{
 					ApiRuleNode: &apimodels.ApiRuleNode{
-						For:         interval,
+						For:         &interval,
 						Labels:      map[string]string{"label1": "val1"},
 						Annotations: map[string]string{"annotation1": "val1"},
 					},
 					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
-						Title:     getLongString(ngstore.AlertRuleMaxTitleLength + 1),
+						Title:     getLongString(t, ngstore.AlertRuleMaxTitleLength+1),
 						Condition: "A",
-						Data: []ngmodels.AlertQuery{
+						Data: []apimodels.AlertQuery{
 							{
 								RefID: "A",
-								RelativeTimeRange: ngmodels.RelativeTimeRange{
-									From: ngmodels.Duration(time.Duration(5) * time.Hour),
-									To:   ngmodels.Duration(time.Duration(3) * time.Hour),
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
 								},
-								DatasourceUID: "-100",
+								DatasourceUID: expr.DatasourceUID,
 								Model: json.RawMessage(`{
 									"type": "math",
 									"expression": "2 + 3 > 1"
@@ -247,28 +955,28 @@ func TestAlertRuleCRUD(t *testing.T) {
 						},
 					},
 				},
-				expectedResponse: `{"error":"invalid alert rule: name length should not be greater than 190", "message":"failed to update rule group"}`,
+				expectedMessage: "invalid rule specification at index [0]: alert rule title is too long. Max length is 190",
 			},
 			{
 				desc:      "alert rule with too long rulegroup",
-				rulegroup: getLongString(ngstore.AlertRuleMaxTitleLength + 1),
+				rulegroup: getLongString(t, ngstore.AlertRuleMaxTitleLength+1),
 				rule: apimodels.PostableExtendedRuleNode{
 					ApiRuleNode: &apimodels.ApiRuleNode{
-						For:         interval,
+						For:         &interval,
 						Labels:      map[string]string{"label1": "val1"},
 						Annotations: map[string]string{"annotation1": "val1"},
 					},
 					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
 						Title:     "AlwaysFiring",
 						Condition: "A",
-						Data: []ngmodels.AlertQuery{
+						Data: []apimodels.AlertQuery{
 							{
 								RefID: "A",
-								RelativeTimeRange: ngmodels.RelativeTimeRange{
-									From: ngmodels.Duration(time.Duration(5) * time.Hour),
-									To:   ngmodels.Duration(time.Duration(3) * time.Hour),
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
 								},
-								DatasourceUID: "-100",
+								DatasourceUID: expr.DatasourceUID,
 								Model: json.RawMessage(`{
 									"type": "math",
 									"expression": "2 + 3 > 1"
@@ -277,7 +985,7 @@ func TestAlertRuleCRUD(t *testing.T) {
 						},
 					},
 				},
-				expectedResponse: `{"error":"invalid alert rule: rule group name length should not be greater than 190", "message":"failed to update rule group"}`,
+				expectedMessage: "rule group name is too long. Max length is 190",
 			},
 			{
 				desc:      "alert rule with invalid interval",
@@ -285,21 +993,21 @@ func TestAlertRuleCRUD(t *testing.T) {
 				interval:  invalidInterval,
 				rule: apimodels.PostableExtendedRuleNode{
 					ApiRuleNode: &apimodels.ApiRuleNode{
-						For:         interval,
+						For:         &interval,
 						Labels:      map[string]string{"label1": "val1"},
 						Annotations: map[string]string{"annotation1": "val1"},
 					},
 					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
 						Title:     "AlwaysFiring",
 						Condition: "A",
-						Data: []ngmodels.AlertQuery{
+						Data: []apimodels.AlertQuery{
 							{
 								RefID: "A",
-								RelativeTimeRange: ngmodels.RelativeTimeRange{
-									From: ngmodels.Duration(time.Duration(5) * time.Hour),
-									To:   ngmodels.Duration(time.Duration(3) * time.Hour),
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
 								},
-								DatasourceUID: "-100",
+								DatasourceUID: expr.DatasourceUID,
 								Model: json.RawMessage(`{
 									"type": "math",
 									"expression": "2 + 3 > 1"
@@ -308,26 +1016,26 @@ func TestAlertRuleCRUD(t *testing.T) {
 						},
 					},
 				},
-				expectedResponse: `{"error":"invalid alert rule: interval (1s) should be divided exactly by scheduler interval: 10s", "message":"failed to update rule group"}`,
+				expectedMessage: "rule evaluation interval (1 second) should be positive number that is multiple of the base interval of 10 seconds",
 			},
 			{
 				desc:      "alert rule with unknown datasource",
 				rulegroup: "arulegroup",
 				rule: apimodels.PostableExtendedRuleNode{
 					ApiRuleNode: &apimodels.ApiRuleNode{
-						For:         interval,
+						For:         &interval,
 						Labels:      map[string]string{"label1": "val1"},
 						Annotations: map[string]string{"annotation1": "val1"},
 					},
 					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
 						Title:     "AlwaysFiring",
 						Condition: "A",
-						Data: []ngmodels.AlertQuery{
+						Data: []apimodels.AlertQuery{
 							{
 								RefID: "A",
-								RelativeTimeRange: ngmodels.RelativeTimeRange{
-									From: ngmodels.Duration(time.Duration(5) * time.Hour),
-									To:   ngmodels.Duration(time.Duration(3) * time.Hour),
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
 								},
 								DatasourceUID: "unknown",
 								Model: json.RawMessage(`{
@@ -338,28 +1046,39 @@ func TestAlertRuleCRUD(t *testing.T) {
 						},
 					},
 				},
-				expectedResponse: `{"error":"invalid query A: data source not found: unknown", "message":"failed to validate alert rule AlwaysFiring"}`,
+				expectedCode: func() int {
+					if setting.IsEnterprise {
+						return http.StatusForbidden
+					}
+					return http.StatusBadRequest
+				}(),
+				expectedMessage: func() string {
+					if setting.IsEnterprise {
+						return "user is not authorized to create a new alert rule 'AlwaysFiring'"
+					}
+					return "failed to update rule group: invalid alert rule 'AlwaysFiring': failed to build query 'A': data source not found"
+				}(),
 			},
 			{
 				desc:      "alert rule with invalid condition",
 				rulegroup: "arulegroup",
 				rule: apimodels.PostableExtendedRuleNode{
 					ApiRuleNode: &apimodels.ApiRuleNode{
-						For:         interval,
+						For:         &interval,
 						Labels:      map[string]string{"label1": "val1"},
 						Annotations: map[string]string{"annotation1": "val1"},
 					},
 					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
 						Title:     "AlwaysFiring",
 						Condition: "B",
-						Data: []ngmodels.AlertQuery{
+						Data: []apimodels.AlertQuery{
 							{
 								RefID: "A",
-								RelativeTimeRange: ngmodels.RelativeTimeRange{
-									From: ngmodels.Duration(time.Duration(5) * time.Hour),
-									To:   ngmodels.Duration(time.Duration(3) * time.Hour),
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
 								},
-								DatasourceUID: "-100",
+								DatasourceUID: expr.DatasourceUID,
 								Model: json.RawMessage(`{
 									"type": "math",
 									"expression": "2 + 3 > 1"
@@ -368,7 +1087,7 @@ func TestAlertRuleCRUD(t *testing.T) {
 						},
 					},
 				},
-				expectedResponse: `{"error":"condition B not found in any query or expression: it should be one of: [A]", "message":"failed to validate alert rule AlwaysFiring"}`,
+				expectedMessage: "invalid rule specification at index [0]: invalid alert rule: condition B does not exist, must be one of [A]",
 			},
 		}
 
@@ -381,24 +1100,17 @@ func TestAlertRuleCRUD(t *testing.T) {
 						tc.rule,
 					},
 				}
-				buf := bytes.Buffer{}
-				enc := json.NewEncoder(&buf)
-				err := enc.Encode(&rules)
+				_, status, body := apiClient.PostRulesGroupWithStatus(t, "default", &rules)
+				res := &Response{}
+				err = json.Unmarshal([]byte(body), &res)
 				require.NoError(t, err)
 
-				u := fmt.Sprintf("http://%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
-				// nolint:gosec
-				resp, err := http.Post(u, "application/json", &buf)
-				require.NoError(t, err)
-				t.Cleanup(func() {
-					err := resp.Body.Close()
-					require.NoError(t, err)
-				})
-				b, err := ioutil.ReadAll(resp.Body)
-				require.NoError(t, err)
-
-				assert.Equal(t, resp.StatusCode, http.StatusBadRequest)
-				require.JSONEq(t, tc.expectedResponse, string(b))
+				assert.Equal(t, tc.expectedMessage, res.Message)
+				expectedCode := tc.expectedCode
+				if expectedCode == 0 {
+					expectedCode = http.StatusBadRequest
+				}
+				assert.Equal(t, expectedCode, status)
 			})
 		}
 	}
@@ -412,7 +1124,7 @@ func TestAlertRuleCRUD(t *testing.T) {
 			Rules: []apimodels.PostableExtendedRuleNode{
 				{
 					ApiRuleNode: &apimodels.ApiRuleNode{
-						For:         interval,
+						For:         &interval,
 						Labels:      map[string]string{"label1": "val1"},
 						Annotations: map[string]string{"annotation1": "val1"},
 					},
@@ -421,14 +1133,14 @@ func TestAlertRuleCRUD(t *testing.T) {
 					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
 						Title:     "AlwaysFiring",
 						Condition: "A",
-						Data: []ngmodels.AlertQuery{
+						Data: []apimodels.AlertQuery{
 							{
 								RefID: "A",
-								RelativeTimeRange: ngmodels.RelativeTimeRange{
-									From: ngmodels.Duration(time.Duration(5) * time.Hour),
-									To:   ngmodels.Duration(time.Duration(3) * time.Hour),
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
 								},
-								DatasourceUID: "-100",
+								DatasourceUID: expr.DatasourceUID,
 								Model: json.RawMessage(`{
 									"type": "math",
 									"expression": "2 + 3 > 1"
@@ -441,14 +1153,14 @@ func TestAlertRuleCRUD(t *testing.T) {
 					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
 						Title:     "AlwaysFiringButSilenced",
 						Condition: "A",
-						Data: []ngmodels.AlertQuery{
+						Data: []apimodels.AlertQuery{
 							{
 								RefID: "A",
-								RelativeTimeRange: ngmodels.RelativeTimeRange{
-									From: ngmodels.Duration(time.Duration(5) * time.Hour),
-									To:   ngmodels.Duration(time.Duration(3) * time.Hour),
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
 								},
-								DatasourceUID: "-100",
+								DatasourceUID: expr.DatasourceUID,
 								Model: json.RawMessage(`{
 									"type": "math",
 									"expression": "2 + 3 > 1"
@@ -456,34 +1168,22 @@ func TestAlertRuleCRUD(t *testing.T) {
 							},
 						},
 						NoDataState:  apimodels.NoDataState(ngmodels.Alerting),
-						ExecErrState: apimodels.ExecutionErrorState(ngmodels.KeepLastStateErrState),
+						ExecErrState: apimodels.ExecutionErrorState(ngmodels.AlertingErrState),
 					},
 				},
 			},
 		}
-		buf := bytes.Buffer{}
-		enc := json.NewEncoder(&buf)
-		err := enc.Encode(&rules)
-		require.NoError(t, err)
-
-		u := fmt.Sprintf("http://%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
-		// nolint:gosec
-		resp, err := http.Post(u, "application/json", &buf)
-		require.NoError(t, err)
-		t.Cleanup(func() {
-			err := resp.Body.Close()
-			require.NoError(t, err)
-		})
-		b, err := ioutil.ReadAll(resp.Body)
-		require.NoError(t, err)
-
-		assert.Equal(t, resp.StatusCode, 202)
-		require.JSONEq(t, `{"message":"rule group updated successfully"}`, string(b))
+		resp, status, _ := apiClient.PostRulesGroupWithStatus(t, "default", &rules)
+		assert.Equal(t, http.StatusAccepted, status)
+		require.Equal(t, "rule group updated successfully", resp.Message)
+		assert.Len(t, resp.Created, 2)
+		assert.Empty(t, resp.Updated)
+		assert.Empty(t, resp.Deleted)
 	}
 
 	// With the rules created, let's make sure that rule definition is stored correctly.
 	{
-		u := fmt.Sprintf("http://%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
+		u := fmt.Sprintf("http://grafana:password@%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
 		// nolint:gosec
 		resp, err := http.Get(u)
 		require.NoError(t, err)
@@ -491,7 +1191,7 @@ func TestAlertRuleCRUD(t *testing.T) {
 			err := resp.Body.Close()
 			require.NoError(t, err)
 		})
-		b, err := ioutil.ReadAll(resp.Body)
+		b, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 
 		assert.Equal(t, resp.StatusCode, 202)
@@ -523,7 +1223,7 @@ func TestAlertRuleCRUD(t *testing.T) {
 					   },
 					   "grafana_alert":{
 						  "id":1,
-						  "orgId":2,
+						  "orgId":1,
 						  "title":"AlwaysFiring",
 						  "condition":"A",
 						  "data":[
@@ -534,21 +1234,21 @@ func TestAlertRuleCRUD(t *testing.T) {
 								   "from":18000,
 								   "to":10800
 								},
-								"datasourceUid":"-100",
+								"datasourceUid":"__expr__",
 								"model":{
 								   "expression":"2 + 3 \u003e 1",
 								   "intervalMs":1000,
-								   "maxDataPoints":100,
+								   "maxDataPoints":43200,
 								   "type":"math"
 								}
 							 }
 						  ],
 						  "updated":"2021-02-21T01:10:30Z",
 						  "intervalSeconds":60,
+						  "is_paused": false,
 						  "version":1,
 						  "uid":"uid",
 						  "namespace_uid":"nsuid",
-						  "namespace_id":1,
 						  "rule_group":"arulegroup",
 						  "no_data_state":"NoData",
 						  "exec_err_state":"Alerting"
@@ -556,9 +1256,10 @@ func TestAlertRuleCRUD(t *testing.T) {
 					},
 					{
 					   "expr":"",
+					   "for": "0s",
 					   "grafana_alert":{
 						  "id":2,
-						  "orgId":2,
+						  "orgId":1,
 						  "title":"AlwaysFiringButSilenced",
 						  "condition":"A",
 						  "data":[
@@ -569,24 +1270,24 @@ func TestAlertRuleCRUD(t *testing.T) {
 								   "from":18000,
 								   "to":10800
 								},
-								"datasourceUid":"-100",
+								"datasourceUid":"__expr__",
 								"model":{
 								   "expression":"2 + 3 \u003e 1",
 								   "intervalMs":1000,
-								   "maxDataPoints":100,
+								   "maxDataPoints":43200,
 								   "type":"math"
 								}
 							 }
 						  ],
 						  "updated":"2021-02-21T01:10:30Z",
 						  "intervalSeconds":60,
+						  "is_paused": false,
 						  "version":1,
 						  "uid":"uid",
 						  "namespace_uid":"nsuid",
-						  "namespace_id":1,
 						  "rule_group":"arulegroup",
 						  "no_data_state":"Alerting",
-						  "exec_err_state":"KeepLastState"
+						  "exec_err_state":"Alerting"
 					   }
 					}
 				 ]
@@ -606,7 +1307,7 @@ func TestAlertRuleCRUD(t *testing.T) {
 			Rules: []apimodels.PostableExtendedRuleNode{
 				{
 					ApiRuleNode: &apimodels.ApiRuleNode{
-						For: interval,
+						For: &interval,
 						Labels: map[string]string{
 							"label1": "val42",
 							"foo":    "bar",
@@ -620,14 +1321,14 @@ func TestAlertRuleCRUD(t *testing.T) {
 						UID:       "unknown",
 						Title:     "AlwaysNormal",
 						Condition: "A",
-						Data: []ngmodels.AlertQuery{
+						Data: []apimodels.AlertQuery{
 							{
 								RefID: "A",
-								RelativeTimeRange: ngmodels.RelativeTimeRange{
-									From: ngmodels.Duration(time.Duration(5) * time.Hour),
-									To:   ngmodels.Duration(time.Duration(3) * time.Hour),
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
 								},
-								DatasourceUID: "-100",
+								DatasourceUID: expr.DatasourceUID,
 								Model: json.RawMessage(`{
 											"type": "math",
 											"expression": "2 + 3 < 1"
@@ -635,40 +1336,135 @@ func TestAlertRuleCRUD(t *testing.T) {
 							},
 						},
 						NoDataState:  apimodels.NoDataState(ngmodels.Alerting),
-						ExecErrState: apimodels.ExecutionErrorState(ngmodels.KeepLastStateErrState),
+						ExecErrState: apimodels.ExecutionErrorState(ngmodels.AlertingErrState),
 					},
 				},
 			},
+			Interval: interval,
 		}
-		buf := bytes.Buffer{}
-		enc := json.NewEncoder(&buf)
-		err = enc.Encode(&rules)
-		require.NoError(t, err)
 
-		u := fmt.Sprintf("http://%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
-		// nolint:gosec
-		resp, err := http.Post(u, "application/json", &buf)
-		require.NoError(t, err)
-		t.Cleanup(func() {
-			err := resp.Body.Close()
-			require.NoError(t, err)
-		})
-		b, err := ioutil.ReadAll(resp.Body)
-		require.NoError(t, err)
-
-		assert.Equal(t, http.StatusNotFound, resp.StatusCode)
-		require.JSONEq(t, `{"error":"failed to get alert rule unknown: could not find alert rule", "message": "failed to update rule group"}`, string(b))
+		_, status, body := apiClient.PostRulesGroupWithStatus(t, "default", &rules)
+		assert.Equal(t, http.StatusNotFound, status)
+		var res map[string]any
+		assert.NoError(t, json.Unmarshal([]byte(body), &res))
+		require.Equal(t, "failed to update rule group: failed to update rule with UID unknown because could not find alert rule", res["message"])
 
 		// let's make sure that rule definitions are not affected by the failed POST request.
-		u = fmt.Sprintf("http://%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
+		u := fmt.Sprintf("http://grafana:password@%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
 		// nolint:gosec
-		resp, err = http.Get(u)
+		resp, err := http.Get(u)
 		require.NoError(t, err)
 		t.Cleanup(func() {
 			err := resp.Body.Close()
 			require.NoError(t, err)
 		})
-		b, err = ioutil.ReadAll(resp.Body)
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+
+		assert.Equal(t, resp.StatusCode, 202)
+
+		body, m := rulesNamespaceWithoutVariableValues(t, b)
+		returnedUIDs, ok := m["default,arulegroup"]
+		assert.True(t, ok)
+		assert.Equal(t, 2, len(returnedUIDs))
+		assert.JSONEq(t, expectedGetNamespaceResponseBody, body)
+	}
+
+	// try to update by pass two rules with conflicting UIDs
+	{
+		interval, err := model.ParseDuration("30s")
+		require.NoError(t, err)
+
+		rules := apimodels.PostableRuleGroupConfig{
+			Name: "arulegroup",
+			Rules: []apimodels.PostableExtendedRuleNode{
+				{
+					ApiRuleNode: &apimodels.ApiRuleNode{
+						For: &interval,
+						Labels: map[string]string{
+							"label1": "val42",
+							"foo":    "bar",
+						},
+						Annotations: map[string]string{
+							"annotation1": "val42",
+							"foo":         "bar",
+						},
+					},
+					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
+						UID:       ruleUID,
+						Title:     "AlwaysNormal",
+						Condition: "A",
+						Data: []apimodels.AlertQuery{
+							{
+								RefID: "A",
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
+								},
+								DatasourceUID: expr.DatasourceUID,
+								Model: json.RawMessage(`{
+												"type": "math",
+												"expression": "2 + 3 < 1"
+												}`),
+							},
+						},
+						NoDataState:  apimodels.NoDataState(ngmodels.Alerting),
+						ExecErrState: apimodels.ExecutionErrorState(ngmodels.AlertingErrState),
+					},
+				},
+				{
+					ApiRuleNode: &apimodels.ApiRuleNode{
+						For: &interval,
+						Labels: map[string]string{
+							"label1": "val42",
+							"foo":    "bar",
+						},
+						Annotations: map[string]string{
+							"annotation1": "val42",
+							"foo":         "bar",
+						},
+					},
+					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
+						UID:       ruleUID,
+						Title:     "AlwaysAlerting",
+						Condition: "A",
+						Data: []apimodels.AlertQuery{
+							{
+								RefID: "A",
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
+								},
+								DatasourceUID: expr.DatasourceUID,
+								Model: json.RawMessage(`{
+												"type": "math",
+												"expression": "2 + 3 > 1"
+												}`),
+							},
+						},
+						NoDataState:  apimodels.NoDataState(ngmodels.Alerting),
+						ExecErrState: apimodels.ExecutionErrorState(ngmodels.AlertingErrState),
+					},
+				},
+			},
+			Interval: interval,
+		}
+		_, status, body := apiClient.PostRulesGroupWithStatus(t, "default", &rules)
+		assert.Equal(t, http.StatusBadRequest, status)
+		var res map[string]any
+		require.NoError(t, json.Unmarshal([]byte(body), &res))
+		require.Equal(t, fmt.Sprintf("rule [1] has UID %s that is already assigned to another rule at index 0", ruleUID), res["message"])
+
+		// let's make sure that rule definitions are not affected by the failed POST request.
+		u := fmt.Sprintf("http://grafana:password@%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
+		// nolint:gosec
+		resp, err := http.Get(u)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			err := resp.Body.Close()
+			require.NoError(t, err)
+		})
+		b, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 
 		assert.Equal(t, resp.StatusCode, 202)
@@ -682,7 +1478,7 @@ func TestAlertRuleCRUD(t *testing.T) {
 
 	// update the first rule and completely remove the other
 	{
-		interval, err := model.ParseDuration("30s")
+		forValue, err := model.ParseDuration("30s")
 		require.NoError(t, err)
 
 		rules := apimodels.PostableRuleGroupConfig{
@@ -690,28 +1486,30 @@ func TestAlertRuleCRUD(t *testing.T) {
 			Rules: []apimodels.PostableExtendedRuleNode{
 				{
 					ApiRuleNode: &apimodels.ApiRuleNode{
-						For: interval,
+						For: &forValue,
 						Labels: map[string]string{
-							"label1": "val42",
-							"foo":    "bar",
+							// delete foo label
+							"label1": "val1", // update label value
+							"label2": "val2", // new label
 						},
 						Annotations: map[string]string{
-							"annotation1": "val42",
-							"foo":         "bar",
+							// delete foo annotation
+							"annotation1": "val1", // update annotation value
+							"annotation2": "val2", // new annotation
 						},
 					},
 					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
 						UID:       ruleUID, // Including the UID in the payload makes the endpoint update the existing rule.
 						Title:     "AlwaysNormal",
 						Condition: "A",
-						Data: []ngmodels.AlertQuery{
+						Data: []apimodels.AlertQuery{
 							{
 								RefID: "A",
-								RelativeTimeRange: ngmodels.RelativeTimeRange{
-									From: ngmodels.Duration(time.Duration(5) * time.Hour),
-									To:   ngmodels.Duration(time.Duration(3) * time.Hour),
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
 								},
-								DatasourceUID: "-100",
+								DatasourceUID: expr.DatasourceUID,
 								Model: json.RawMessage(`{
 											"type": "math",
 											"expression": "2 + 3 < 1"
@@ -719,40 +1517,27 @@ func TestAlertRuleCRUD(t *testing.T) {
 							},
 						},
 						NoDataState:  apimodels.NoDataState(ngmodels.Alerting),
-						ExecErrState: apimodels.ExecutionErrorState(ngmodels.KeepLastStateErrState),
+						ExecErrState: apimodels.ExecutionErrorState(ngmodels.AlertingErrState),
 					},
 				},
 			},
+			Interval: interval,
 		}
-		buf := bytes.Buffer{}
-		enc := json.NewEncoder(&buf)
-		err = enc.Encode(&rules)
-		require.NoError(t, err)
-
-		u := fmt.Sprintf("http://%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
-		// nolint:gosec
-		resp, err := http.Post(u, "application/json", &buf)
-		require.NoError(t, err)
-		t.Cleanup(func() {
-			err := resp.Body.Close()
-			require.NoError(t, err)
-		})
-		b, err := ioutil.ReadAll(resp.Body)
-		require.NoError(t, err)
-
-		assert.Equal(t, resp.StatusCode, 202)
-		require.JSONEq(t, `{"message":"rule group updated successfully"}`, string(b))
+		respModel, status, _ := apiClient.PostRulesGroupWithStatus(t, "default", &rules)
+		assert.Equal(t, http.StatusAccepted, status)
+		require.Equal(t, respModel.Updated, []string{ruleUID})
+		require.Len(t, respModel.Deleted, 1)
 
 		// let's make sure that rule definitions are updated correctly.
-		u = fmt.Sprintf("http://%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
+		u := fmt.Sprintf("http://grafana:password@%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
 		// nolint:gosec
-		resp, err = http.Get(u)
+		resp, err := http.Get(u)
 		require.NoError(t, err)
 		t.Cleanup(func() {
 			err := resp.Body.Close()
 			require.NoError(t, err)
 		})
-		b, err = ioutil.ReadAll(resp.Body)
+		b, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 
 		assert.Equal(t, resp.StatusCode, 202)
@@ -771,18 +1556,18 @@ func TestAlertRuleCRUD(t *testing.T) {
 		         "rules":[
 		            {
 						"annotations": {
-							"annotation1": "val42",
-							"foo": "bar"
+							"annotation1": "val1",
+							"annotation2": "val2"
 					   },
 		               "expr":"",
 					   "for": "30s",
 					   "labels": {
-							"foo": "bar",
-							"label1": "val42"
+							"label1": "val1",
+							"label2": "val2"
 					   },
 		               "grafana_alert":{
 		                  "id":1,
-		                  "orgId":2,
+		                  "orgId":1,
 		                  "title":"AlwaysNormal",
 		                  "condition":"A",
 		                  "data":[
@@ -793,24 +1578,24 @@ func TestAlertRuleCRUD(t *testing.T) {
 		                           "from":18000,
 		                           "to":10800
 		                        },
-		                        "datasourceUid":"-100",
+		                        "datasourceUid":"__expr__",
 								"model":{
 		                           "expression":"2 + 3 \u003C 1",
 		                           "intervalMs":1000,
-		                           "maxDataPoints":100,
+		                           "maxDataPoints":43200,
 		                           "type":"math"
 		                        }
 		                     }
 		                  ],
 		                  "updated":"2021-02-21T01:10:30Z",
 		                  "intervalSeconds":60,
+		                  "is_paused": false,
 		                  "version":2,
 		                  "uid":"uid",
 		                  "namespace_uid":"nsuid",
-		                  "namespace_id":1,
 		                  "rule_group":"arulegroup",
 		                  "no_data_state":"Alerting",
-		                  "exec_err_state":"KeepLastState"
+		                  "exec_err_state":"Alerting"
 		               }
 		            }
 		         ]
@@ -819,11 +1604,208 @@ func TestAlertRuleCRUD(t *testing.T) {
 		}`, body)
 	}
 
+	// update the rule; delete labels and annotations
+	{
+		forValue, err := model.ParseDuration("30s")
+		require.NoError(t, err)
+
+		rules := apimodels.PostableRuleGroupConfig{
+			Name: "arulegroup",
+			Rules: []apimodels.PostableExtendedRuleNode{
+				{
+					ApiRuleNode: &apimodels.ApiRuleNode{
+						For: &forValue,
+					},
+					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
+						UID:       ruleUID, // Including the UID in the payload makes the endpoint update the existing rule.
+						Title:     "AlwaysNormal",
+						Condition: "A",
+						Data: []apimodels.AlertQuery{
+							{
+								RefID: "A",
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
+								},
+								DatasourceUID: expr.DatasourceUID,
+								Model: json.RawMessage(`{
+												"type": "math",
+												"expression": "2 + 3 < 1"
+												}`),
+							},
+						},
+						NoDataState:  apimodels.NoDataState(ngmodels.Alerting),
+						ExecErrState: apimodels.ExecutionErrorState(ngmodels.AlertingErrState),
+					},
+				},
+			},
+			Interval: interval,
+		}
+		respModel, status, _ := apiClient.PostRulesGroupWithStatus(t, "default", &rules)
+		assert.Equal(t, http.StatusAccepted, status)
+		require.Equal(t, respModel.Updated, []string{ruleUID})
+
+		// let's make sure that rule definitions are updated correctly.
+		u := fmt.Sprintf("http://grafana:password@%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
+		// nolint:gosec
+		resp, err := http.Get(u)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			err := resp.Body.Close()
+			require.NoError(t, err)
+		})
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+
+		assert.Equal(t, resp.StatusCode, 202)
+
+		body, m := rulesNamespaceWithoutVariableValues(t, b)
+		returnedUIDs, ok := m["default,arulegroup"]
+		assert.True(t, ok)
+		assert.Equal(t, 1, len(returnedUIDs))
+		assert.Equal(t, ruleUID, returnedUIDs[0])
+		assert.JSONEq(t, `
+			{
+			   "default":[
+			      {
+				 "name":"arulegroup",
+				 "interval":"1m",
+				 "rules":[
+				    {
+				       "expr":"",
+				       "for": "30s",
+				       "grafana_alert":{
+					  "id":1,
+					  "orgId":1,
+					  "title":"AlwaysNormal",
+					  "condition":"A",
+					  "data":[
+					     {
+						"refId":"A",
+						"queryType":"",
+						"relativeTimeRange":{
+						   "from":18000,
+						   "to":10800
+						},
+						"datasourceUid":"__expr__",
+									"model":{
+						   "expression":"2 + 3 \u003C 1",
+						   "intervalMs":1000,
+						   "maxDataPoints":43200,
+						   "type":"math"
+						}
+					     }
+					  ],
+					  "updated":"2021-02-21T01:10:30Z",
+					  "intervalSeconds":60,
+					  "is_paused":false,
+					  "version":3,
+					  "uid":"uid",
+					  "namespace_uid":"nsuid",
+					  "rule_group":"arulegroup",
+					  "no_data_state":"Alerting",
+					  "exec_err_state":"Alerting"
+				       }
+				    }
+				 ]
+			      }
+			   ]
+			}`, body)
+	}
+
+	// update the rule; keep title, condition, no data state, error state, queries and expressions if not provided. should be noop
+	{
+		rules := apimodels.PostableRuleGroupConfig{
+			Name: "arulegroup",
+			Rules: []apimodels.PostableExtendedRuleNode{
+				{
+					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
+						UID: ruleUID, // Including the UID in the payload makes the endpoint update the existing rule.
+					},
+				},
+			},
+			Interval: interval,
+		}
+		respModel, status, _ := apiClient.PostRulesGroupWithStatus(t, "default", &rules)
+		assert.Equal(t, http.StatusAccepted, status)
+		require.Equal(t, "no changes detected in the rule group", respModel.Message)
+		assert.Empty(t, respModel.Created)
+		assert.Empty(t, respModel.Updated)
+		assert.Empty(t, respModel.Deleted)
+
+		// let's make sure that rule definitions are updated correctly.
+		u := fmt.Sprintf("http://grafana:password@%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
+		// nolint:gosec
+		resp, err := http.Get(u)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			err := resp.Body.Close()
+			require.NoError(t, err)
+		})
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+
+		assert.Equal(t, resp.StatusCode, 202)
+
+		body, m := rulesNamespaceWithoutVariableValues(t, b)
+		returnedUIDs, ok := m["default,arulegroup"]
+		assert.True(t, ok)
+		assert.Equal(t, 1, len(returnedUIDs))
+		assert.Equal(t, ruleUID, returnedUIDs[0])
+		assert.JSONEq(t, `
+			{
+			   "default":[
+			      {
+				 "name":"arulegroup",
+				 "interval":"1m",
+				 "rules":[
+				    {
+				       "expr":"",
+                       "for": "30s",
+				       "grafana_alert":{
+					  "id":1,
+					  "orgId":1,
+					  "title":"AlwaysNormal",
+					  "condition":"A",
+					  "data":[
+					     {
+						"refId":"A",
+						"queryType":"",
+						"relativeTimeRange":{
+						   "from":18000,
+						   "to":10800
+						},
+						"datasourceUid":"__expr__",
+									"model":{
+						   "expression":"2 + 3 \u003C 1",
+						   "intervalMs":1000,
+						   "maxDataPoints":43200,
+						   "type":"math"
+						}
+					     }
+					  ],
+					  "updated":"2021-02-21T01:10:30Z",
+					  "intervalSeconds":60,
+					  "is_paused":false,
+					  "version":3,
+					  "uid":"uid",
+					  "namespace_uid":"nsuid",
+					  "rule_group":"arulegroup",
+					  "no_data_state":"Alerting",
+					  "exec_err_state":"Alerting"
+				       }
+				    }
+				 ]
+			      }
+			   ]
+			}`, body)
+	}
+
 	client := &http.Client{}
 	// Finally, make sure we can delete it.
 	{
-		t.Run("fail if he rule group name does not exists", func(t *testing.T) {
-			u := fmt.Sprintf("http://%s/api/ruler/grafana/api/v1/rules/default/groupnotexist", grafanaListedAddr)
+		t.Run("succeed if the rule group name does not exists", func(t *testing.T) {
+			u := fmt.Sprintf("http://grafana:password@%s/api/ruler/grafana/api/v1/rules/default/groupnotexist", grafanaListedAddr)
 			req, err := http.NewRequest(http.MethodDelete, u, nil)
 			require.NoError(t, err)
 			resp, err := client.Do(req)
@@ -832,219 +1814,330 @@ func TestAlertRuleCRUD(t *testing.T) {
 				err := resp.Body.Close()
 				require.NoError(t, err)
 			})
-			b, err := ioutil.ReadAll(resp.Body)
-			require.NoError(t, err)
-
-			require.Equal(t, http.StatusNotFound, resp.StatusCode)
-			require.JSONEq(t, `{"error":"rule group not found under this namespace", "message": "failed to delete rule group"}`, string(b))
-		})
-
-		t.Run("succeed if the rule group name does exist", func(t *testing.T) {
-			u := fmt.Sprintf("http://%s/api/ruler/grafana/api/v1/rules/default/arulegroup", grafanaListedAddr)
-			req, err := http.NewRequest(http.MethodDelete, u, nil)
-			require.NoError(t, err)
-			resp, err := client.Do(req)
-			require.NoError(t, err)
-			t.Cleanup(func() {
-				err := resp.Body.Close()
-				require.NoError(t, err)
-			})
-			b, err := ioutil.ReadAll(resp.Body)
+			b, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 
 			require.Equal(t, http.StatusAccepted, resp.StatusCode)
-			require.JSONEq(t, `{"message":"rule group deleted"}`, string(b))
+			var res map[string]any
+			require.NoError(t, json.Unmarshal(b, &res))
+			require.Equal(t, "rules deleted", res["message"])
+		})
+
+		t.Run("succeed if the rule group name does exist", func(t *testing.T) {
+			u := fmt.Sprintf("http://grafana:password@%s/api/ruler/grafana/api/v1/rules/default/arulegroup", grafanaListedAddr)
+			req, err := http.NewRequest(http.MethodDelete, u, nil)
+			require.NoError(t, err)
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				err := resp.Body.Close()
+				require.NoError(t, err)
+			})
+			b, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+
+			require.Equal(t, http.StatusAccepted, resp.StatusCode)
+			require.JSONEq(t, `{"message":"rules deleted"}`, string(b))
 		})
 	}
+}
+
+func TestIntegrationAlertmanagerStatus(t *testing.T) {
+	testinfra.SQLiteIntegrationTest(t)
+
+	// Setup Grafana and its Database
+	dir, path := testinfra.CreateGrafDir(t, testinfra.GrafanaOpts{
+		DisableLegacyAlerting: true,
+		EnableUnifiedAlerting: true,
+		AppModeProduction:     true,
+	})
+
+	grafanaListedAddr, _ := testinfra.StartGrafana(t, dir, path)
+
+	// Get the Alertmanager current status.
+	{
+		alertsURL := fmt.Sprintf("http://%s/api/alertmanager/grafana/api/v2/status", grafanaListedAddr)
+		// nolint:gosec
+		resp, err := http.Get(alertsURL)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			err := resp.Body.Close()
+			require.NoError(t, err)
+		})
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Equal(t, 200, resp.StatusCode)
+		require.JSONEq(t, `
+{
+	"cluster": {
+		"peers": [],
+		"status": "disabled"
+	},
+	"config": {
+		"route": {
+			"receiver": "grafana-default-email",
+			"group_by": ["grafana_folder", "alertname"]
+		},
+		"templates": null,
+		"receivers": [{
+			"name": "grafana-default-email",
+			"grafana_managed_receiver_configs": [{
+				"uid": "",
+				"name": "email receiver",
+				"type": "email",
+				"disableResolveMessage": false,
+				"settings": {
+					"addresses": "\u003cexample@email.com\u003e"
+				},
+				"secureSettings": null
+			}]
+		}]
+	},
+	"uptime": null,
+	"versionInfo": {
+		"branch": "N/A",
+		"buildDate": "N/A",
+		"buildUser": "N/A",
+		"goVersion": "N/A",
+		"revision": "N/A",
+		"version": "N/A"
+	}
+}
+`, string(b))
+	}
+}
+
+func TestIntegrationQuota(t *testing.T) {
+	testinfra.SQLiteIntegrationTest(t)
+
+	// Setup Grafana and its Database
+	dir, path := testinfra.CreateGrafDir(t, testinfra.GrafanaOpts{
+		DisableLegacyAlerting: true,
+		EnableUnifiedAlerting: true,
+		EnableQuota:           true,
+		DisableAnonymous:      true,
+		AppModeProduction:     true,
+	})
+
+	grafanaListedAddr, store := testinfra.StartGrafana(t, dir, path)
+
+	// Create a user to make authenticated requests
+	createUser(t, store, user.CreateUserCommand{
+		// needs permission to update org quota
+		IsAdmin:        true,
+		DefaultOrgRole: string(org.RoleEditor),
+		Password:       "password",
+		Login:          "grafana",
+	})
+	apiClient := newAlertingApiClient(grafanaListedAddr, "grafana", "password")
+	// Create the namespace we'll save our alerts to.
+	apiClient.CreateFolder(t, "default", "default")
+
+	interval, err := model.ParseDuration("1m")
+	require.NoError(t, err)
+
+	// Create rule under folder1
+	createRule(t, apiClient, "default")
+
+	// get the generated rule UID
+	var ruleUID string
+	{
+		u := fmt.Sprintf("http://grafana:password@%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
+		// nolint:gosec
+		resp, err := http.Get(u)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			err := resp.Body.Close()
+			require.NoError(t, err)
+		})
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+
+		assert.Equal(t, resp.StatusCode, 202)
+
+		_, m := rulesNamespaceWithoutVariableValues(t, b)
+		generatedUIDs, ok := m["default,arulegroup"]
+		assert.True(t, ok)
+		assert.Equal(t, 1, len(generatedUIDs))
+		ruleUID = generatedUIDs[0]
+	}
+
+	// check quota limits
+	t.Run("when quota limit exceed creating new rule should fail", func(t *testing.T) {
+		// get existing org quota
+		limit, used := apiClient.GetOrgQuotaLimits(t, 1)
+		apiClient.UpdateAlertRuleOrgQuota(t, 1, used)
+		t.Cleanup(func() {
+			apiClient.UpdateAlertRuleOrgQuota(t, 1, limit)
+		})
+
+		// try to create an alert rule
+		rules := apimodels.PostableRuleGroupConfig{
+			Name:     "arulegroup",
+			Interval: interval,
+			Rules: []apimodels.PostableExtendedRuleNode{
+				{
+					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
+						Title:     "One more alert rule",
+						Condition: "A",
+						Data: []apimodels.AlertQuery{
+							{
+								RefID: "A",
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
+								},
+								DatasourceUID: expr.DatasourceUID,
+								Model: json.RawMessage(`{
+									"type": "math",
+									"expression": "2 + 3 > 1"
+									}`),
+							},
+						},
+					},
+				},
+			},
+		}
+		_, status, body := apiClient.PostRulesGroupWithStatus(t, "default", &rules)
+		assert.Equal(t, http.StatusForbidden, status)
+		var res map[string]any
+		require.NoError(t, json.Unmarshal([]byte(body), &res))
+		require.Equal(t, "quota has been exceeded", res["message"])
+	})
+
+	t.Run("when quota limit exceed updating existing rule should succeed", func(t *testing.T) {
+		// try to create an alert rule
+		rules := apimodels.PostableRuleGroupConfig{
+			Name:     "arulegroup",
+			Interval: interval,
+			Rules: []apimodels.PostableExtendedRuleNode{
+				{
+					GrafanaManagedAlert: &apimodels.PostableGrafanaRule{
+						Title:     "Updated alert rule",
+						Condition: "A",
+						Data: []apimodels.AlertQuery{
+							{
+								RefID: "A",
+								RelativeTimeRange: apimodels.RelativeTimeRange{
+									From: apimodels.Duration(time.Duration(5) * time.Hour),
+									To:   apimodels.Duration(time.Duration(3) * time.Hour),
+								},
+								DatasourceUID: expr.DatasourceUID,
+								Model: json.RawMessage(`{
+									"type": "math",
+									"expression": "2 + 4 > 1"
+									}`),
+							},
+						},
+						UID: ruleUID,
+					},
+				},
+			},
+		}
+
+		respModel, status, _ := apiClient.PostRulesGroupWithStatus(t, "default", &rules)
+		assert.Equal(t, http.StatusAccepted, status)
+		require.Len(t, respModel.Updated, 1)
+
+		// let's make sure that rule definitions are updated correctly.
+		u := fmt.Sprintf("http://grafana:password@%s/api/ruler/grafana/api/v1/rules/default", grafanaListedAddr)
+		// nolint:gosec
+		resp, err := http.Get(u)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			err := resp.Body.Close()
+			require.NoError(t, err)
+		})
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+
+		assert.Equal(t, resp.StatusCode, 202)
+
+		body, m := rulesNamespaceWithoutVariableValues(t, b)
+		returnedUIDs, ok := m["default,arulegroup"]
+		assert.True(t, ok)
+		assert.Equal(t, 1, len(returnedUIDs))
+		assert.Equal(t, ruleUID, returnedUIDs[0])
+		assert.JSONEq(t, `
+				{
+				   "default":[
+				      {
+					 "name":"arulegroup",
+					 "interval":"1m",
+					 "rules":[
+					    {
+					       "expr":"",
+						   "for": "2m",
+					       "grafana_alert":{
+						  "id":1,
+						  "orgId":1,
+						  "title":"Updated alert rule",
+						  "condition":"A",
+						  "data":[
+						     {
+							"refId":"A",
+							"queryType":"",
+							"relativeTimeRange":{
+							   "from":18000,
+							   "to":10800
+							},
+							"datasourceUid":"__expr__",
+										"model":{
+							   "expression":"2 + 4 \u003E 1",
+							   "intervalMs":1000,
+							   "maxDataPoints":43200,
+							   "type":"math"
+							}
+						     }
+						  ],
+						  "updated":"2021-02-21T01:10:30Z",
+						  "intervalSeconds":60,
+						  "is_paused": false,
+						  "version":2,
+						  "uid":"uid",
+						  "namespace_uid":"nsuid",
+						  "rule_group":"arulegroup",
+						  "no_data_state":"NoData",
+						  "exec_err_state":"Alerting"
+					       }
+					    }
+					 ]
+				      }
+				   ]
+				}`, body)
+	})
+}
+
+func TestIntegrationEval(t *testing.T) {
+	testinfra.SQLiteIntegrationTest(t)
+
+	// Setup Grafana and its Database
+	dir, path := testinfra.CreateGrafDir(t, testinfra.GrafanaOpts{
+		DisableLegacyAlerting: true,
+		EnableUnifiedAlerting: true,
+		EnableQuota:           true,
+		DisableAnonymous:      true,
+		AppModeProduction:     true,
+	})
+
+	grafanaListedAddr, store := testinfra.StartGrafana(t, dir, path)
+
+	createUser(t, store, user.CreateUserCommand{
+		DefaultOrgRole: string(org.RoleEditor),
+		Password:       "password",
+		Login:          "grafana",
+	})
+	apiClient := newAlertingApiClient(grafanaListedAddr, "grafana", "password")
+	// Create the namespace we'll save our alerts to.
+	apiClient.CreateFolder(t, "default", "default")
 
 	// test eval conditions
 	testCases := []struct {
 		desc               string
 		payload            string
-		expectedStatusCode int
-		expectedResponse   string
-	}{
-		{
-			desc: "alerting condition",
-			payload: `
-			{
-				"grafana_condition": {
-				"condition": "A",
-				"data": [
-					{
-						"refId": "A",
-						"relativeTimeRange": {
-							"from": 18000,
-							"to": 10800
-						},
-						"datasourceUid":"-100",
-						"model": {
-							"type":"math",
-							"expression":"1 < 2"
-						}
-					}
-				],
-				"now": "2021-04-11T14:38:14Z"
-				}
-			}
-			`,
-			expectedStatusCode: http.StatusOK,
-			expectedResponse: `{
-			"instances": [
-			  {
-				"schema": {
-				  "name": "evaluation results",
-				  "fields": [
-					{
-					  "name": "State",
-					  "type": "string",
-					  "typeInfo": {
-						"frame": "string"
-					  }
-					}
-				  ]
-				},
-				"data": {
-				  "values": [
-					[
-					  "Alerting"
-					]
-				  ]
-				}
-			  }
-			]
-		  }`,
-		},
-		{
-			desc: "normal condition",
-			payload: `
-			{
-				"grafana_condition": {
-				"condition": "A",
-				"data": [
-					{
-						"refId": "A",
-						"relativeTimeRange": {
-							"from": 18000,
-							"to": 10800
-						},
-						"datasourceUid": "-100",
-						"model": {
-							"type":"math",
-							"expression":"1 > 2"
-						}
-					}
-				],
-				"now": "2021-04-11T14:38:14Z"
-				}
-			}
-			`,
-			expectedStatusCode: http.StatusOK,
-			expectedResponse: `{
-			"instances": [
-			  {
-				"schema": {
-				  "name": "evaluation results",
-				  "fields": [
-					{
-					  "name": "State",
-					  "type": "string",
-					  "typeInfo": {
-						"frame": "string"
-					  }
-					}
-				  ]
-				},
-				"data": {
-				  "values": [
-					[
-					  "Normal"
-					]
-				  ]
-				}
-			  }
-			]
-		  }`,
-		},
-		{
-			desc: "condition not found in any query or expression",
-			payload: `
-			{
-				"grafana_condition": {
-				"condition": "B",
-				"data": [
-					{
-						"refId": "A",
-						"relativeTimeRange": {
-							"from": 18000,
-							"to": 10800
-						},
-						"datasourceUid": "-100",
-						"model": {
-							"type":"math",
-							"expression":"1 > 2"
-						}
-					}
-				],
-				"now": "2021-04-11T14:38:14Z"
-				}
-			}
-			`,
-			expectedStatusCode: http.StatusBadRequest,
-			expectedResponse:   `{"error":"condition B not found in any query or expression: it should be one of: [A]","message":"invalid condition"}`,
-		},
-		{
-			desc: "unknown query datasource",
-			payload: `
-			{
-				"grafana_condition": {
-				"condition": "A",
-				"data": [
-					{
-						"refId": "A",
-						"relativeTimeRange": {
-							"from": 18000,
-							"to": 10800
-						},
-						"datasourceUid": "unknown",
-						"model": {
-						}
-					}
-				],
-				"now": "2021-04-11T14:38:14Z"
-				}
-			}
-			`,
-			expectedStatusCode: http.StatusBadRequest,
-			expectedResponse:   `{"error":"invalid query A: data source not found: unknown","message":"invalid condition"}`,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.desc, func(t *testing.T) {
-			u := fmt.Sprintf("http://%s/api/v1/rule/test/grafana", grafanaListedAddr)
-			r := strings.NewReader(tc.payload)
-			// nolint:gosec
-			resp, err := http.Post(u, "application/json", r)
-			require.NoError(t, err)
-			t.Cleanup(func() {
-				err := resp.Body.Close()
-				require.NoError(t, err)
-			})
-			b, err := ioutil.ReadAll(resp.Body)
-			require.NoError(t, err)
-
-			assert.Equal(t, tc.expectedStatusCode, resp.StatusCode)
-			require.JSONEq(t, tc.expectedResponse, string(b))
-		})
-	}
-
-	// test eval queries and expressions
-	testCases = []struct {
-		desc               string
-		payload            string
-		expectedStatusCode int
-		expectedResponse   string
+		expectedStatusCode func() int
+		expectedResponse   func() string
+		expectedMessage    func() string
 	}{
 		{
 			desc: "alerting condition",
@@ -1057,20 +2150,24 @@ func TestAlertRuleCRUD(t *testing.T) {
 								"from": 18000,
 								"to": 10800
 							},
-							"datasourceUid": "-100",
+							"datasourceUid": "__expr__",
 							"model": {
 								"type":"math",
 								"expression":"1 < 2"
 							}
 						}
 					],
+				"condition": "A",
 				"now": "2021-04-11T14:38:14Z"
 			}
 			`,
-			expectedStatusCode: http.StatusOK,
-			expectedResponse: `{
+			expectedMessage:    func() string { return "" },
+			expectedStatusCode: func() int { return http.StatusOK },
+			expectedResponse: func() string {
+				return `{
 				"results": {
 				  "A": {
+					"status": 200,
 					"frames": [
 					  {
 						"schema": {
@@ -1097,7 +2194,8 @@ func TestAlertRuleCRUD(t *testing.T) {
 					]
 				  }
 				}
-			}`,
+			}`
+			},
 		},
 		{
 			desc: "normal condition",
@@ -1110,20 +2208,24 @@ func TestAlertRuleCRUD(t *testing.T) {
 								"from": 18000,
 								"to": 10800
 							},
-							"datasourceUid": "-100",
+							"datasourceUid": "__expr__",
 							"model": {
 								"type":"math",
 								"expression":"1 > 2"
 							}
 						}
 					],
+				"condition": "A",
 				"now": "2021-04-11T14:38:14Z"
 			}
 			`,
-			expectedStatusCode: http.StatusOK,
-			expectedResponse: `{
+			expectedMessage:    func() string { return "" },
+			expectedStatusCode: func() int { return http.StatusOK },
+			expectedResponse: func() string {
+				return `{
 				"results": {
 				  "A": {
+					"status": 200,
 					"frames": [
 					  {
 						"schema": {
@@ -1150,7 +2252,8 @@ func TestAlertRuleCRUD(t *testing.T) {
 					]
 				  }
 				}
-			}`,
+			}`
+			},
 		},
 		{
 			desc: "unknown query datasource",
@@ -1168,17 +2271,86 @@ func TestAlertRuleCRUD(t *testing.T) {
 							}
 						}
 					],
+				"condition": "A",
 				"now": "2021-04-11T14:38:14Z"
 			}
 			`,
-			expectedStatusCode: http.StatusBadRequest,
-			expectedResponse:   `{"error":"invalid query A: data source not found: unknown","message":"invalid queries or expressions"}`,
+			expectedResponse: func() string { return "" },
+			expectedStatusCode: func() int {
+				if setting.IsEnterprise {
+					return http.StatusForbidden
+				}
+				return http.StatusBadRequest
+			},
+			expectedMessage: func() string {
+				if setting.IsEnterprise {
+					return "user is not authorized to access one or many data sources"
+				}
+				return "Failed to build evaluator for queries and expressions: failed to build query 'A': data source not found"
+			},
+		},
+		{
+			desc: "condition is empty",
+			payload: `
+			{
+				"data": [
+						{
+							"refId": "A",
+							"relativeTimeRange": {
+								"from": 18000,
+								"to": 10800
+							},
+							"datasourceUid": "__expr__",
+							"model": {
+								"type":"math",
+								"expression":"1 > 2"
+							}
+						}
+					],
+				"now": "2021-04-11T14:38:14Z"
+			}
+			`,
+			expectedStatusCode: func() int { return http.StatusOK },
+			expectedMessage:    func() string { return "" },
+			expectedResponse: func() string {
+				return `{
+				"results": {
+				  "A": {
+					"status": 200,
+					"frames": [
+					  {
+						"schema": {
+						  "refId": "A",
+						  "fields": [
+							{
+							  "name": "A",
+							  "type": "number",
+							  "typeInfo": {
+								"frame": "float64",
+								"nullable": true
+							  }
+							}
+						  ]
+						},
+						"data": {
+						  "values": [
+							[
+							  0
+							]
+						  ]
+						}
+					  }
+					]
+				  }
+				}
+			}`
+			},
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
-			u := fmt.Sprintf("http://%s/api/v1/eval", grafanaListedAddr)
+			u := fmt.Sprintf("http://grafana:password@%s/api/v1/eval", grafanaListedAddr)
 			r := strings.NewReader(tc.payload)
 			// nolint:gosec
 			resp, err := http.Post(u, "application/json", r)
@@ -1187,31 +2359,21 @@ func TestAlertRuleCRUD(t *testing.T) {
 				err := resp.Body.Close()
 				require.NoError(t, err)
 			})
-			b, err := ioutil.ReadAll(resp.Body)
+			b, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			res := Response{}
+			err = json.Unmarshal(b, &res)
 			require.NoError(t, err)
 
-			assert.Equal(t, tc.expectedStatusCode, resp.StatusCode)
-			require.JSONEq(t, tc.expectedResponse, string(b))
+			assert.Equal(t, tc.expectedStatusCode(), resp.StatusCode)
+			if tc.expectedResponse() != "" {
+				require.JSONEq(t, tc.expectedResponse(), string(b))
+			}
+			if tc.expectedMessage() != "" {
+				require.Equal(t, tc.expectedMessage(), res.Message)
+			}
 		})
 	}
-}
-
-// createFolder creates a folder for storing our alerts under. Grafana uses folders as a replacement for alert namespaces to match its permission model.
-// We use the dashboard command using IsFolder = true to tell it's a folder, it takes the dashboard as the name of the folder.
-func createFolder(t *testing.T, store *sqlstore.SQLStore, folderID int64, folderName string) error {
-	t.Helper()
-
-	cmd := models.SaveDashboardCommand{
-		OrgId:    2, // This is the orgID of the anonymous user.
-		FolderId: folderID,
-		IsFolder: true,
-		Dashboard: simplejson.NewFromAny(map[string]interface{}{
-			"title": folderName,
-		}),
-	}
-	_, err := store.SaveDashboard(cmd)
-
-	return err
 }
 
 // rulesNamespaceWithoutVariableValues takes a apimodels.NamespaceConfigResponse JSON-based input and makes the dynamic fields static e.g. uid, dates, etc.
@@ -1244,7 +2406,26 @@ func rulesNamespaceWithoutVariableValues(t *testing.T, b []byte) (string, map[st
 	return string(json), m
 }
 
-func getLongString(n int) string {
+func createUser(t *testing.T, store *sqlstore.SQLStore, cmd user.CreateUserCommand) int64 {
+	t.Helper()
+
+	store.Cfg.AutoAssignOrg = true
+	store.Cfg.AutoAssignOrgId = 1
+
+	quotaService := quotaimpl.ProvideService(store, store.Cfg)
+	orgService, err := orgimpl.ProvideService(store, store.Cfg, quotaService)
+	require.NoError(t, err)
+	usrSvc, err := userimpl.ProvideService(store, orgService, store.Cfg, nil, nil, quotaService, supportbundlestest.NewFakeBundleService())
+	require.NoError(t, err)
+
+	u, err := usrSvc.Create(context.Background(), &cmd)
+	require.NoError(t, err)
+	return u.ID
+}
+
+func getLongString(t *testing.T, n int) string {
+	t.Helper()
+
 	b := make([]rune, n)
 	for i := range b {
 		b[i] = 'a'

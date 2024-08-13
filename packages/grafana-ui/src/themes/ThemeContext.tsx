@@ -1,7 +1,11 @@
-import { createTheme, GrafanaTheme, GrafanaThemeV2 } from '@grafana/data';
 import hoistNonReactStatics from 'hoist-non-react-statics';
+import memoize from 'micro-memoize';
 import React, { useContext } from 'react';
+
+import { GrafanaTheme, GrafanaTheme2, ThemeContext } from '@grafana/data';
+
 import { Themeable, Themeable2 } from '../types/theme';
+
 import { stylesFactory } from './stylesFactory';
 
 type Omit<T, K> = Pick<T, Exclude<keyof T, K>>;
@@ -10,18 +14,13 @@ type Subtract<T, K> = Omit<T, keyof K>;
 /**
  * Mock used in tests
  */
-let ThemeContextMock: React.Context<GrafanaThemeV2> | null = null;
+let ThemeContextMock: React.Context<GrafanaTheme2> | null = null;
 
 // Used by useStyles()
 export const memoizedStyleCreators = new WeakMap();
 
-// Use Grafana Dark theme by default
-/** @public */
-export const ThemeContext = React.createContext(createTheme());
-
-ThemeContext.displayName = 'ThemeContext';
-
 /** @deprecated use withTheme2 */
+/** @public */
 export const withTheme = <P extends Themeable, S extends {} = {}>(Component: React.ComponentType<P>) => {
   const WithTheme: React.FunctionComponent<Subtract<P, Themeable>> = (props) => {
     /**
@@ -62,11 +61,13 @@ export const withTheme2 = <P extends Themeable2, S extends {} = {}>(Component: R
 };
 
 /** @deprecated use useTheme2 */
+/** @public */
 export function useTheme(): GrafanaTheme {
   return useContext(ThemeContextMock || ThemeContext).v1;
 }
 
-export function useTheme2(): GrafanaThemeV2 {
+/** @public */
+export function useTheme2(): GrafanaTheme2 {
   return useContext(ThemeContextMock || ThemeContext);
 }
 
@@ -77,10 +78,13 @@ export function useTheme2(): GrafanaThemeV2 {
  * you pass in doesn't change, or only if it needs to. (i.e. declare
  * your style creator outside of a function component or use `useCallback()`.)
  * */
+/** @deprecated use useStyles2 */
+/** @public */
 export function useStyles<T>(getStyles: (theme: GrafanaTheme) => T) {
   const theme = useTheme();
 
-  let memoizedStyleCreator = memoizedStyleCreators.get(getStyles) as typeof getStyles;
+  let memoizedStyleCreator: typeof getStyles = memoizedStyleCreators.get(getStyles);
+
   if (!memoizedStyleCreator) {
     memoizedStyleCreator = stylesFactory(getStyles);
     memoizedStyleCreators.set(getStyles, memoizedStyleCreator);
@@ -90,29 +94,45 @@ export function useStyles<T>(getStyles: (theme: GrafanaTheme) => T) {
 }
 
 /**
- * Hook for using memoized styles with access to the theme.
+ * Hook for using memoized styles with access to the theme. Pass additional
+ * arguments to the getStyles function as additional arguments to this hook.
  *
- * NOTE: For memoization to work, you need to ensure that the function
- * you pass in doesn't change, or only if it needs to. (i.e. declare
- * your style creator outside of a function component or use `useCallback()`.)
+ * Prefer using primitive values (boolean, number, string, etc) for
+ * additional arguments for better performance
+ *
+ * ```
+ * const getStyles = (theme, isDisabled, isOdd) => {css(...)}
+ * [...]
+ * const styles = useStyles2(getStyles, true, Boolean(index % 2))
+ * ```
+ *
+ * NOTE: For memoization to work, ensure that all arguments don't change
+ * across renders (or only change if they need to)
+ *
+ * @public
  * */
-export function useStyles2<T>(getStyles: (theme: GrafanaThemeV2) => T) {
+export function useStyles2<T extends unknown[], CSSReturnValue>(
+  getStyles: (theme: GrafanaTheme2, ...args: T) => CSSReturnValue,
+  ...additionalArguments: T
+): CSSReturnValue {
   const theme = useTheme2();
 
-  let memoizedStyleCreator = memoizedStyleCreators.get(getStyles) as typeof getStyles;
+  let memoizedStyleCreator: typeof getStyles = memoizedStyleCreators.get(getStyles);
+
   if (!memoizedStyleCreator) {
-    memoizedStyleCreator = stylesFactory(getStyles);
+    memoizedStyleCreator = memoize(getStyles, { maxSize: 10 }); // each getStyles function will memoize 10 different sets of props
     memoizedStyleCreators.set(getStyles, memoizedStyleCreator);
   }
 
-  return memoizedStyleCreator(theme);
+  return memoizedStyleCreator(theme, ...additionalArguments);
 }
 
 /**
- * Enables theme context  mocking
+ * Enables theme context mocking
  */
-export const mockThemeContext = (theme: Partial<GrafanaThemeV2>) => {
-  ThemeContextMock = React.createContext(theme as GrafanaThemeV2);
+/** @public */
+export const mockThemeContext = (theme: Partial<GrafanaTheme2>) => {
+  ThemeContextMock = React.createContext(theme as GrafanaTheme2);
 
   return () => {
     ThemeContextMock = null;

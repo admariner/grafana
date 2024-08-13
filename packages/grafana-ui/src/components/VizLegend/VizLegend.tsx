@@ -1,29 +1,39 @@
 import React, { useCallback } from 'react';
-import { LegendProps, VizLegendItem } from './types';
-import { LegendDisplayMode } from './models.gen';
-import { VizLegendTable } from './VizLegendTable';
-import { VizLegendList } from './VizLegendList';
+
 import { DataHoverClearEvent, DataHoverEvent } from '@grafana/data';
-import { usePanelContext } from '../PanelChrome';
+import { LegendDisplayMode } from '@grafana/schema';
+
+import { SeriesVisibilityChangeMode, usePanelContext } from '../PanelChrome';
+
+import { VizLegendList } from './VizLegendList';
+import { VizLegendTable } from './VizLegendTable';
+import { LegendProps, SeriesVisibilityChangeBehavior, VizLegendItem } from './types';
+import { mapMouseEventToMode } from './utils';
 
 /**
  * @public
  */
-export const VizLegend: React.FunctionComponent<LegendProps> = ({
+export function VizLegend<T>({
   items,
   displayMode,
   sortBy: sortKey,
+  seriesVisibilityChangeBehavior = SeriesVisibilityChangeBehavior.Isolate,
   sortDesc,
-  onToggleSort,
   onLabelClick,
-  onSeriesColorChange,
+  onToggleSort,
   placement,
   className,
-}) => {
-  const { eventBus } = usePanelContext();
+  itemRenderer,
+  readonly,
+  isSortable,
+}: LegendProps<T>) {
+  const { eventBus, onToggleSeriesVisibility, onToggleLegendSort } = usePanelContext();
 
-  const onMouseEnter = useCallback(
-    (item: VizLegendItem, event: React.MouseEvent<HTMLElement, MouseEvent>) => {
+  const onMouseOver = useCallback(
+    (
+      item: VizLegendItem,
+      event: React.MouseEvent<HTMLButtonElement, MouseEvent> | React.FocusEvent<HTMLButtonElement>
+    ) => {
       eventBus?.publish({
         type: DataHoverEvent.type,
         payload: {
@@ -38,7 +48,10 @@ export const VizLegend: React.FunctionComponent<LegendProps> = ({
   );
 
   const onMouseOut = useCallback(
-    (item: VizLegendItem, event: React.MouseEvent<HTMLElement, MouseEvent>) => {
+    (
+      item: VizLegendItem,
+      event: React.MouseEvent<HTMLButtonElement, MouseEvent> | React.FocusEvent<HTMLButtonElement>
+    ) => {
       eventBus?.publish({
         type: DataHoverClearEvent.type,
         payload: {
@@ -52,37 +65,57 @@ export const VizLegend: React.FunctionComponent<LegendProps> = ({
     [eventBus]
   );
 
+  const onLegendLabelClick = useCallback(
+    (item: VizLegendItem, event: React.MouseEvent<HTMLButtonElement, MouseEvent>) => {
+      if (onLabelClick) {
+        onLabelClick(item, event);
+      }
+      if (onToggleSeriesVisibility) {
+        onToggleSeriesVisibility(
+          item.label,
+          seriesVisibilityChangeBehavior === SeriesVisibilityChangeBehavior.Hide
+            ? SeriesVisibilityChangeMode.AppendToSelection
+            : mapMouseEventToMode(event)
+        );
+      }
+    },
+    [onToggleSeriesVisibility, onLabelClick, seriesVisibilityChangeBehavior]
+  );
+
   switch (displayMode) {
     case LegendDisplayMode.Table:
       return (
-        <VizLegendTable
+        <VizLegendTable<T>
           className={className}
           items={items}
           placement={placement}
           sortBy={sortKey}
           sortDesc={sortDesc}
-          onLabelClick={onLabelClick}
-          onToggleSort={onToggleSort}
-          onLabelMouseEnter={onMouseEnter}
+          onLabelClick={onLegendLabelClick}
+          onToggleSort={onToggleSort || onToggleLegendSort}
+          onLabelMouseOver={onMouseOver}
           onLabelMouseOut={onMouseOut}
-          onSeriesColorChange={onSeriesColorChange}
+          itemRenderer={itemRenderer}
+          readonly={readonly}
+          isSortable={isSortable}
         />
       );
     case LegendDisplayMode.List:
       return (
-        <VizLegendList
+        <VizLegendList<T>
           className={className}
           items={items}
           placement={placement}
-          onLabelMouseEnter={onMouseEnter}
+          onLabelMouseOver={onMouseOver}
           onLabelMouseOut={onMouseOut}
-          onLabelClick={onLabelClick}
-          onSeriesColorChange={onSeriesColorChange}
+          onLabelClick={onLegendLabelClick}
+          itemRenderer={itemRenderer}
+          readonly={readonly}
         />
       );
     default:
       return null;
   }
-};
+}
 
-VizLegend.displayName = 'Legend';
+VizLegend.displayName = 'VizLegend';

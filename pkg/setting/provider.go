@@ -32,7 +32,16 @@ func (v ValidationError) Error() string {
 // Provider is a settings provider abstraction
 // with thread-safety and runtime updates.
 type Provider interface {
-	// Update
+	// Current returns a SettingsBag with a static copy of
+	// the current configured pairs of key/values for each
+	// configuration section.
+	Current() SettingsBag
+
+	CurrentVerbose() VerboseSettingsBag
+
+	// Update receives a SettingsBag with the pairs of key/values
+	// to be updated per section and a SettingsRemovals with the
+	// section keys to be removed.
 	Update(updates SettingsBag, removals SettingsRemovals) error
 	// KeyValue returns a key-value abstraction
 	// for the given pair of section and key.
@@ -86,11 +95,38 @@ type ReloadHandler interface {
 type SettingsBag map[string]map[string]string
 type SettingsRemovals map[string][]string
 
-type OSSImpl struct {
-	Cfg *Cfg `inject:""`
+type VerboseSourceType string
+type VerboseSettingsBag map[string]map[string]map[VerboseSourceType]string
+
+const (
+	DB     VerboseSourceType = "db"
+	System VerboseSourceType = "system"
+)
+
+func ProvideProvider(cfg *Cfg) *OSSImpl {
+	return &OSSImpl{
+		Cfg: cfg,
+	}
 }
 
-func (o OSSImpl) Init() error {
+type OSSImpl struct {
+	Cfg *Cfg
+}
+
+func (o *OSSImpl) Current() SettingsBag {
+	settingsCopy := make(SettingsBag)
+
+	for _, section := range o.Cfg.Raw.Sections() {
+		settingsCopy[section.Name()] = make(map[string]string)
+		for _, key := range section.Keys() {
+			settingsCopy[section.Name()][key.Name()] = RedactedValue(EnvKey(section.Name(), key.Name()), key.Value())
+		}
+	}
+
+	return settingsCopy
+}
+
+func (o *OSSImpl) CurrentVerbose() VerboseSettingsBag {
 	return nil
 }
 
@@ -106,7 +142,13 @@ func (o *OSSImpl) Section(section string) Section {
 	return &sectionImpl{section: o.Cfg.Raw.Section(section)}
 }
 
-func (OSSImpl) RegisterReloadHandler(string, ReloadHandler) {}
+func (*OSSImpl) RegisterReloadHandler(string, ReloadHandler) {}
+
+// Deprecated: use feature toggles
+func (o *OSSImpl) IsFeatureToggleEnabled(name string) bool {
+	// nolint:staticcheck
+	return o.Cfg.IsFeatureToggleEnabled(name)
+}
 
 type keyValImpl struct {
 	key *ini.Key

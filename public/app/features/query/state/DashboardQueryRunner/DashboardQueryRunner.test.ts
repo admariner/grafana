@@ -1,37 +1,40 @@
 import { throwError } from 'rxjs';
-import { delay } from 'rxjs/operators';
-import { setDataSourceSrv } from '@grafana/runtime';
-import { AlertState, AlertStateInfo } from '@grafana/data';
+import { delay, first } from 'rxjs/operators';
 
-import * as annotationsSrv from '../../../annotations/annotations_srv';
-import { getDefaultOptions, LEGACY_DS_NAME, NEXT_GEN_DS_NAME, toAsyncOfResult } from './testHelpers';
-import { backendSrv } from '../../../../core/services/backend_srv';
-import { DashboardQueryRunner, DashboardQueryRunnerResult } from './types';
+import { AlertState, AlertStateInfo } from '@grafana/data';
+import { DataSourceSrv, setDataSourceSrv } from '@grafana/runtime';
+import { TimeSrv } from 'app/features/dashboard/services/TimeSrv';
+
 import { silenceConsoleOutput } from '../../../../../test/core/utils/silenceConsoleOutput';
+import { backendSrv } from '../../../../core/services/backend_srv';
+import * as annotationsSrv from '../../../annotations/executeAnnotationQuery';
+
 import { createDashboardQueryRunner } from './DashboardQueryRunner';
+import { getDefaultOptions, LEGACY_DS_NAME, NEXT_GEN_DS_NAME, toAsyncOfResult } from './testHelpers';
+import { DashboardQueryRunner, DashboardQueryRunnerResult } from './types';
 
 jest.mock('@grafana/runtime', () => ({
-  ...((jest.requireActual('@grafana/runtime') as unknown) as object),
+  ...jest.requireActual('@grafana/runtime'),
   getBackendSrv: () => backendSrv,
 }));
 
 function getTestContext() {
   jest.clearAllMocks();
-  const timeSrvMock: any = { timeRange: jest.fn() };
+  const timeSrvMock = { timeRange: jest.fn() } as unknown as TimeSrv;
   const options = getDefaultOptions();
   // These tests are setup so all the workers and runners are invoked once, this wouldn't be the case in real life
   const runner = createDashboardQueryRunner({ dashboard: options.dashboard, timeSrv: timeSrvMock });
 
   const getResults: AlertStateInfo[] = [
-    { id: 1, state: AlertState.Alerting, newStateDate: '2021-01-01', dashboardId: 1, panelId: 1 },
-    { id: 2, state: AlertState.Alerting, newStateDate: '2021-02-01', dashboardId: 1, panelId: 2 },
+    { id: 1, state: AlertState.Alerting, dashboardId: 1, panelId: 1 },
+    { id: 2, state: AlertState.Alerting, dashboardId: 1, panelId: 2 },
   ];
   const getMock = jest.spyOn(backendSrv, 'get').mockResolvedValue(getResults);
   const executeAnnotationQueryMock = jest
     .spyOn(annotationsSrv, 'executeAnnotationQuery')
     .mockReturnValue(toAsyncOfResult({ events: [{ id: 'NextGen' }] }));
   const annotationQueryMock = jest.fn().mockResolvedValue([{ id: 'Legacy' }]);
-  const dataSourceSrvMock: any = {
+  const dataSourceSrvMock = {
     get: async (name: string) => {
       if (name === LEGACY_DS_NAME) {
         return {
@@ -47,7 +50,7 @@ function getTestContext() {
 
       return {};
     },
-  };
+  } as DataSourceSrv;
   setDataSourceSrv(dataSourceSrvMock);
 
   return { runner, options, annotationQueryMock, executeAnnotationQueryMock, getMock };
@@ -60,18 +63,19 @@ function expectOnResults(args: {
   expect: (results: DashboardQueryRunnerResult) => void;
 }) {
   const { runner, done, panelId, expect: expectCallback } = args;
-  const subscription = runner.getResult(panelId).subscribe({
-    next: (value) => {
-      try {
-        expectCallback(value);
-        subscription.unsubscribe();
-        done();
-      } catch (err) {
-        subscription.unsubscribe();
-        done.fail(err);
-      }
-    },
-  });
+  runner
+    .getResult(panelId)
+    .pipe(first())
+    .subscribe({
+      next: (value) => {
+        try {
+          expectCallback(value);
+          done();
+        } catch (err) {
+          done(err);
+        }
+      },
+    });
 }
 
 describe('DashboardQueryRunnerImpl', () => {
@@ -94,6 +98,56 @@ describe('DashboardQueryRunnerImpl', () => {
       });
 
       runner.run(options);
+    });
+  });
+
+  describe('when calling run and all workers succeed but take longer than 200ms', () => {
+    it('then it should return the empty results', (done) => {
+      const { runner, options, annotationQueryMock, executeAnnotationQueryMock, getMock } = getTestContext();
+      const wait = 201;
+      executeAnnotationQueryMock.mockReturnValue(toAsyncOfResult({ events: [{ id: 'NextGen' }] }).pipe(delay(wait)));
+
+      expectOnResults({
+        runner,
+        panelId: 1,
+        done,
+        expect: (results) => {
+          // should have one alert state, one snapshot, one legacy and one next gen result
+          // having both snapshot and legacy/next gen is a imaginary example for testing purposes and doesn't exist for real
+          expect(results).toEqual({ annotations: [] });
+          expect(annotationQueryMock).toHaveBeenCalledTimes(1);
+          expect(executeAnnotationQueryMock).toHaveBeenCalledTimes(1);
+          expect(getMock).toHaveBeenCalledTimes(1);
+        },
+      });
+
+      runner.run(options);
+    });
+  });
+
+  describe('when calling run and all workers succeed but the subscriber subscribes after the run', () => {
+    it('then it should return the last results', (done) => {
+      const { runner, options, annotationQueryMock, executeAnnotationQueryMock, getMock } = getTestContext();
+
+      runner.run(options);
+
+      setTimeout(
+        () =>
+          expectOnResults({
+            runner,
+            panelId: 1,
+            done,
+            expect: (results) => {
+              // should have one alert state, one snapshot, one legacy and one next gen result
+              // having both snapshot and legacy/next gen is a imaginary example for testing purposes and doesn't exist for real
+              expect(results).toEqual(getExpectedForAllResult());
+              expect(annotationQueryMock).toHaveBeenCalledTimes(1);
+              expect(executeAnnotationQueryMock).toHaveBeenCalledTimes(1);
+              expect(getMock).toHaveBeenCalledTimes(1);
+            },
+          }),
+        200
+      ); // faking a late subscriber to make sure we get the latest results
     });
   });
 
@@ -241,13 +295,12 @@ function getExpectedForAllResult(): DashboardQueryRunnerResult {
     alertState: {
       dashboardId: 1,
       id: 1,
-      newStateDate: '2021-01-01',
       panelId: 1,
       state: AlertState.Alerting,
     },
     annotations: [
       {
-        color: 'pink',
+        color: '#ffc0cb',
         id: 'Legacy',
         isRegion: false,
         source: {
@@ -262,7 +315,7 @@ function getExpectedForAllResult(): DashboardQueryRunnerResult {
         type: 'Test',
       },
       {
-        color: 'pink',
+        color: '#ffc0cb',
         id: 'NextGen',
         isRegion: false,
         source: {
@@ -285,7 +338,7 @@ function getExpectedForAllResult(): DashboardQueryRunnerResult {
           id: 'Snapshotted',
           name: 'Test',
         },
-        color: 'pink',
+        color: '#ffc0cb',
         isRegion: true,
         source: {
           datasource: 'Legacy',

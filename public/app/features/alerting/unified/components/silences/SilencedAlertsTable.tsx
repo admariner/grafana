@@ -1,18 +1,21 @@
-import { AlertmanagerAlert } from 'app/plugins/datasource/alertmanager/types';
-import React, { FC } from 'react';
-import { getAlertTableStyles } from '../../styles/table';
-import { useStyles } from '@grafana/ui';
-import { SilencedAlertsTableRow } from './SilencedAlertsTableRow';
-import { GrafanaTheme } from '@grafana/data';
 import { css, cx } from '@emotion/css';
+import React from 'react';
+
+import { GrafanaTheme2 } from '@grafana/data';
+import { useStyles2 } from '@grafana/ui';
+import { AlertmanagerAlert } from 'app/plugins/datasource/alertmanager/types';
+
+import { getAlertTableStyles } from '../../styles/table';
+
+import { SilencedAlertsTableRow } from './SilencedAlertsTableRow';
 
 interface Props {
   silencedAlerts: AlertmanagerAlert[];
 }
 
-const SilencedAlertsTable: FC<Props> = ({ silencedAlerts }) => {
-  const tableStyles = useStyles(getAlertTableStyles);
-  const styles = useStyles(getStyles);
+const SilencedAlertsTable = ({ silencedAlerts }: Props) => {
+  const tableStyles = useStyles2(getAlertTableStyles);
+  const styles = useStyles2(getStyles);
 
   if (!!silencedAlerts.length) {
     return (
@@ -22,7 +25,6 @@ const SilencedAlertsTable: FC<Props> = ({ silencedAlerts }) => {
           <col className={styles.colState} />
           <col />
           <col className={styles.colName} />
-          <col />
         </colgroup>
         <thead>
           <tr>
@@ -30,7 +32,6 @@ const SilencedAlertsTable: FC<Props> = ({ silencedAlerts }) => {
             <th>State</th>
             <th></th>
             <th>Alert name</th>
-            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -51,9 +52,9 @@ const SilencedAlertsTable: FC<Props> = ({ silencedAlerts }) => {
   }
 };
 
-const getStyles = (theme: GrafanaTheme) => ({
+const getStyles = (theme: GrafanaTheme2) => ({
   tableMargin: css`
-    margin-bottom: ${theme.spacing.sm};
+    margin-bottom: ${theme.spacing(1)};
   `,
   colState: css`
     width: 110px;

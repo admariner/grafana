@@ -13,7 +13,7 @@ func (s Series) Resample(refID string, interval time.Duration, downsampler strin
 	if newSeriesLength <= 0 {
 		return s, fmt.Errorf("the series cannot be sampled further; the time range is shorter than the interval")
 	}
-	resampled := NewSeries(refID, s.GetLabels(), s.TimeIdx, true, s.ValueIdx, true, newSeriesLength+1)
+	resampled := NewSeries(refID, s.GetLabels(), newSeriesLength+1)
 	bookmark := 0
 	var lastSeen *float64
 	idx := 0
@@ -54,6 +54,8 @@ func (s Series) Resample(refID string, interval time.Duration, downsampler strin
 			default:
 				return s, fmt.Errorf("upsampling %v not implemented", upsampler)
 			}
+		} else if len(vals) == 1 {
+			value = vals[0]
 		} else { // downsampling
 			fVec := data.NewField("", s.GetLabels(), vals)
 			ff := Float64Field(*fVec)
@@ -67,15 +69,14 @@ func (s Series) Resample(refID string, interval time.Duration, downsampler strin
 				tmp = Min(&ff)
 			case "max":
 				tmp = Max(&ff)
+			case "last":
+				tmp = Last(&ff)
 			default:
 				return s, fmt.Errorf("downsampling %v not implemented", downsampler)
 			}
 			value = tmp
 		}
-		tv := t // his is required otherwise all points keep the latest timestamp; anything better?
-		if err := resampled.SetPoint(idx, &tv, value); err != nil {
-			return resampled, err
-		}
+		resampled.SetPoint(idx, t, value)
 		t = t.Add(interval)
 		idx++
 	}

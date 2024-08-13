@@ -1,19 +1,22 @@
-import React, { FC, useEffect, useMemo, useState } from 'react';
-import { useDispatch } from 'react-redux';
+import { css } from '@emotion/css';
+import React, { useEffect, useMemo } from 'react';
+import { useFormContext } from 'react-hook-form';
+
+import { GrafanaTheme2, SelectableValue } from '@grafana/data';
+import { Field, InputControl, useStyles2, VirtualizedSelect } from '@grafana/ui';
+import { useDispatch } from 'app/types';
+
 import { useUnifiedAlertingSelector } from '../../hooks/useUnifiedAlertingSelector';
 import { fetchRulerRulesAction } from '../../state/actions';
 import { RuleFormValues } from '../../types/rule-form';
-import { useFormContext } from 'react-hook-form';
-import { SelectableValue } from '@grafana/data';
-import { SelectWithAdd } from './SelectWIthAdd';
-import { Field, InputControl } from '@grafana/ui';
-import { css } from '@emotion/css';
+
+import { checkForPathSeparator } from './util';
 
 interface Props {
-  dataSourceName: string;
+  rulesSourceName: string;
 }
 
-export const GroupAndNamespaceFields: FC<Props> = ({ dataSourceName }) => {
+export const GroupAndNamespaceFields = ({ rulesSourceName }: Props) => {
   const {
     control,
     watch,
@@ -21,15 +24,15 @@ export const GroupAndNamespaceFields: FC<Props> = ({ dataSourceName }) => {
     setValue,
   } = useFormContext<RuleFormValues>();
 
-  const [customGroup, setCustomGroup] = useState(false);
+  const style = useStyles2(getStyle);
 
   const rulerRequests = useUnifiedAlertingSelector((state) => state.rulerRules);
   const dispatch = useDispatch();
   useEffect(() => {
-    dispatch(fetchRulerRulesAction(dataSourceName));
-  }, [dataSourceName, dispatch]);
+    dispatch(fetchRulerRulesAction({ rulesSourceName }));
+  }, [rulesSourceName, dispatch]);
 
-  const rulesConfig = rulerRequests[dataSourceName]?.result;
+  const rulesConfig = rulerRequests[rulesSourceName]?.result;
 
   const namespace = watch('namespace');
 
@@ -46,19 +49,22 @@ export const GroupAndNamespaceFields: FC<Props> = ({ dataSourceName }) => {
   );
 
   return (
-    <>
-      <Field label="Namespace" error={errors.namespace?.message} invalid={!!errors.namespace?.message}>
+    <div className={style.flexRow}>
+      <Field
+        data-testid="namespace-picker"
+        label="Namespace"
+        error={errors.namespace?.message}
+        invalid={!!errors.namespace?.message}
+      >
         <InputControl
           render={({ field: { onChange, ref, ...field } }) => (
-            <SelectWithAdd
+            <VirtualizedSelect
               {...field}
-              className={inputStyle}
+              allowCustomValue
+              className={style.input}
               onChange={(value) => {
                 setValue('group', ''); //reset if namespace changes
-                onChange(value);
-              }}
-              onCustomChange={(custom: boolean) => {
-                custom && setCustomGroup(true);
+                onChange(value.value);
               }}
               options={namespaceOptions}
               width={42}
@@ -68,25 +74,51 @@ export const GroupAndNamespaceFields: FC<Props> = ({ dataSourceName }) => {
           control={control}
           rules={{
             required: { value: true, message: 'Required.' },
+            validate: {
+              pathSeparator: checkForPathSeparator,
+            },
           }}
         />
       </Field>
-      <Field label="Group" error={errors.group?.message} invalid={!!errors.group?.message}>
+      <Field data-testid="group-picker" label="Group" error={errors.group?.message} invalid={!!errors.group?.message}>
         <InputControl
           render={({ field: { ref, ...field } }) => (
-            <SelectWithAdd {...field} options={groupOptions} width={42} custom={customGroup} className={inputStyle} />
+            <VirtualizedSelect
+              {...field}
+              allowCustomValue
+              options={groupOptions}
+              width={42}
+              onChange={(value) => {
+                setValue('group', value.value ?? '');
+              }}
+              className={style.input}
+            />
           )}
           name="group"
           control={control}
           rules={{
             required: { value: true, message: 'Required.' },
+            validate: {
+              pathSeparator: checkForPathSeparator,
+            },
           }}
         />
       </Field>
-    </>
+    </div>
   );
 };
 
-const inputStyle = css`
-  width: 330px;
-`;
+const getStyle = (theme: GrafanaTheme2) => ({
+  flexRow: css`
+    display: flex;
+    flex-direction: row;
+    justify-content: flex-start;
+
+    & > * + * {
+      margin-left: ${theme.spacing(3)};
+    }
+  `,
+  input: css`
+    width: 330px !important;
+  `,
+});

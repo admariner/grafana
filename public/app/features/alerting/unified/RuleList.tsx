@@ -1,157 +1,164 @@
-import { DataSourceInstanceSettings, GrafanaTheme, urlUtil } from '@grafana/data';
-import { useStyles, Button, ButtonGroup, ToolbarButton, Alert } from '@grafana/ui';
-import { SerializedError } from '@reduxjs/toolkit';
-import React, { FC, useEffect, useMemo } from 'react';
-import { useDispatch } from 'react-redux';
+import { css } from '@emotion/css';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useAsyncFn, useInterval } from 'react-use';
+
+import { GrafanaTheme2 } from '@grafana/data';
+import { Button, useStyles2, withErrorBoundary, Stack } from '@grafana/ui';
+import { useQueryParams } from 'app/core/hooks/useQueryParams';
+import { useDispatch } from 'app/types';
+
+import { CombinedRuleNamespace } from '../../../types/unified-alerting';
+
+import { trackRuleListNavigation } from './Analytics';
+import { MoreActionsRuleButtons } from './MoreActionsRuleButtons';
 import { AlertingPageWrapper } from './components/AlertingPageWrapper';
 import { NoRulesSplash } from './components/rules/NoRulesCTA';
-import { useUnifiedAlertingSelector } from './hooks/useUnifiedAlertingSelector';
-import { useFilteredRules } from './hooks/useFilteredRules';
-import { fetchAllPromAndRulerRulesAction } from './state/actions';
-import { getAllRulesSourceNames, getRulesDataSources, GRAFANA_RULES_SOURCE_NAME } from './utils/datasource';
-import { css } from '@emotion/css';
-import { useCombinedRuleNamespaces } from './hooks/useCombinedRuleNamespaces';
-import { RULE_LIST_POLL_INTERVAL_MS } from './utils/constants';
-import { isRulerNotSupportedResponse } from './utils/rules';
-import RulesFilter from './components/rules/RulesFilter';
+import { INSTANCES_DISPLAY_LIMIT } from './components/rules/RuleDetails';
+import { RuleListErrors } from './components/rules/RuleListErrors';
 import { RuleListGroupView } from './components/rules/RuleListGroupView';
 import { RuleListStateView } from './components/rules/RuleListStateView';
-import { useQueryParams } from 'app/core/hooks/useQueryParams';
+import { RuleStats } from './components/rules/RuleStats';
+import RulesFilter from './components/rules/RulesFilter';
+import { useCombinedRuleNamespaces } from './hooks/useCombinedRuleNamespaces';
+import { useFilteredRules, useRulesFilter } from './hooks/useFilteredRules';
+import { useUnifiedAlertingSelector } from './hooks/useUnifiedAlertingSelector';
+import { fetchAllPromAndRulerRulesAction } from './state/actions';
+import { RULE_LIST_POLL_INTERVAL_MS } from './utils/constants';
+import { getAllRulesSourceNames } from './utils/datasource';
 
 const VIEWS = {
   groups: RuleListGroupView,
   state: RuleListStateView,
 };
 
-export const RuleList: FC = () => {
-  const dispatch = useDispatch();
-  const styles = useStyles(getStyles);
-  const rulesDataSourceNames = useMemo(getAllRulesSourceNames, []);
+// make sure we ask for 1 more so we show the "show x more" button
+const LIMIT_ALERTS = INSTANCES_DISPLAY_LIMIT + 1;
 
-  const [queryParams] = useQueryParams();
+const RuleList = withErrorBoundary(
+  () => {
+    const dispatch = useDispatch();
+    const styles = useStyles2(getStyles);
+    const rulesDataSourceNames = useMemo(getAllRulesSourceNames, []);
+    const [expandAll, setExpandAll] = useState(false);
 
-  const view = VIEWS[queryParams['view'] as keyof typeof VIEWS]
-    ? (queryParams['view'] as keyof typeof VIEWS)
-    : 'groups';
+    const onFilterCleared = useCallback(() => setExpandAll(false), []);
 
-  const ViewComponent = VIEWS[view];
+    const [queryParams] = useQueryParams();
+    const { filterState, hasActiveFilters } = useRulesFilter();
 
-  // fetch rules, then poll every RULE_LIST_POLL_INTERVAL_MS
-  useEffect(() => {
-    dispatch(fetchAllPromAndRulerRulesAction());
-    const interval = setInterval(() => dispatch(fetchAllPromAndRulerRulesAction()), RULE_LIST_POLL_INTERVAL_MS);
-    return () => {
-      clearInterval(interval);
-    };
-  }, [dispatch]);
+    const view = VIEWS[queryParams['view'] as keyof typeof VIEWS]
+      ? (queryParams['view'] as keyof typeof VIEWS)
+      : 'groups';
 
-  const promRuleRequests = useUnifiedAlertingSelector((state) => state.promRules);
-  const rulerRuleRequests = useUnifiedAlertingSelector((state) => state.rulerRules);
+    const ViewComponent = VIEWS[view];
 
-  const dispatched = rulesDataSourceNames.some(
-    (name) => promRuleRequests[name]?.dispatched || rulerRuleRequests[name]?.dispatched
-  );
-  const loading = rulesDataSourceNames.some(
-    (name) => promRuleRequests[name]?.loading || rulerRuleRequests[name]?.loading
-  );
-  const haveResults = rulesDataSourceNames.some(
-    (name) =>
-      (promRuleRequests[name]?.result?.length && !promRuleRequests[name]?.error) ||
-      (Object.keys(rulerRuleRequests[name]?.result || {}).length && !rulerRuleRequests[name]?.error)
-  );
+    const promRuleRequests = useUnifiedAlertingSelector((state) => state.promRules);
+    const rulerRuleRequests = useUnifiedAlertingSelector((state) => state.rulerRules);
 
-  const [promReqeustErrors, rulerRequestErrors] = useMemo(
-    () =>
-      [promRuleRequests, rulerRuleRequests].map((requests) =>
-        getRulesDataSources().reduce<Array<{ error: SerializedError; dataSource: DataSourceInstanceSettings }>>(
-          (result, dataSource) => {
-            const error = requests[dataSource.name]?.error;
-            if (requests[dataSource.name] && error && !isRulerNotSupportedResponse(requests[dataSource.name])) {
-              return [...result, { dataSource, error }];
-            }
-            return result;
-          },
-          []
-        )
-      ),
-    [promRuleRequests, rulerRuleRequests]
-  );
+    const loading = rulesDataSourceNames.some(
+      (name) => promRuleRequests[name]?.loading || rulerRuleRequests[name]?.loading
+    );
 
-  const grafanaPromError = promRuleRequests[GRAFANA_RULES_SOURCE_NAME]?.error;
-  const grafanaRulerError = rulerRuleRequests[GRAFANA_RULES_SOURCE_NAME]?.error;
+    const promRequests = Object.entries(promRuleRequests);
+    const rulerRequests = Object.entries(rulerRuleRequests);
 
-  const showNewAlertSplash = dispatched && !loading && !haveResults;
+    const allPromLoaded = promRequests.every(
+      ([_, state]) => state.dispatched && (state?.result !== undefined || state?.error !== undefined)
+    );
+    const allRulerLoaded = rulerRequests.every(
+      ([_, state]) => state.dispatched && (state?.result !== undefined || state?.error !== undefined)
+    );
 
-  const combinedNamespaces = useCombinedRuleNamespaces();
-  const filteredNamespaces = useFilteredRules(combinedNamespaces);
-  return (
-    <AlertingPageWrapper pageId="alert-list" isLoading={loading && !haveResults}>
-      {(promReqeustErrors.length || rulerRequestErrors.length || grafanaPromError) && (
-        <Alert data-testid="cloud-rulessource-errors" title="Errors loading rules" severity="error">
-          {grafanaPromError && (
-            <div>Failed to load Grafana threshold rules state: {grafanaPromError.message || 'Unknown error.'}</div>
-          )}
-          {grafanaRulerError && (
-            <div>Failed to load Grafana threshold rules config: {grafanaRulerError.message || 'Unknown error.'}</div>
-          )}
-          {promReqeustErrors.map(({ dataSource, error }) => (
-            <div key={dataSource.name}>
-              Failed to load rules state from <a href={`datasources/edit/${dataSource.id}`}>{dataSource.name}</a>:{' '}
-              {error.message || 'Unknown error.'}
+    const allPromEmpty = promRequests.every(([_, state]) => state.dispatched && state?.result?.length === 0);
+
+    const allRulerEmpty = rulerRequests.every(([_, state]) => {
+      const rulerRules = Object.entries(state?.result ?? {});
+      const noRules = rulerRules.every(([_, result]) => result?.length === 0);
+      return noRules && state.dispatched;
+    });
+
+    const limitAlerts = hasActiveFilters ? undefined : LIMIT_ALERTS;
+    // Trigger data refresh only when the RULE_LIST_POLL_INTERVAL_MS elapsed since the previous load FINISHED
+    const [_, fetchRules] = useAsyncFn(async () => {
+      if (!loading) {
+        await dispatch(fetchAllPromAndRulerRulesAction(false, { limitAlerts }));
+      }
+    }, [loading, limitAlerts, dispatch]);
+
+    useEffect(() => {
+      trackRuleListNavigation().catch(() => {});
+    }, []);
+
+    // fetch rules, then poll every RULE_LIST_POLL_INTERVAL_MS
+    useEffect(() => {
+      dispatch(fetchAllPromAndRulerRulesAction(false, { limitAlerts }));
+    }, [dispatch, limitAlerts]);
+    useInterval(fetchRules, RULE_LIST_POLL_INTERVAL_MS);
+
+    // Show splash only when we loaded all of the data sources and none of them has alerts
+    const hasNoAlertRulesCreatedYet =
+      allPromLoaded && allPromEmpty && promRequests.length > 0 && allRulerEmpty && allRulerLoaded;
+
+    const combinedNamespaces: CombinedRuleNamespace[] = useCombinedRuleNamespaces();
+    const filteredNamespaces = useFilteredRules(combinedNamespaces, filterState);
+
+    return (
+      // We don't want to show the Loading... indicator for the whole page.
+      // We show separate indicators for Grafana-managed and Cloud rules
+      <AlertingPageWrapper navId="alert-list" isLoading={false}>
+        <RuleListErrors />
+        <RulesFilter onFilterCleared={onFilterCleared} />
+        {!hasNoAlertRulesCreatedYet && (
+          <>
+            <div className={styles.break} />
+            <div className={styles.buttonsContainer}>
+              <div className={styles.statsContainer}>
+                {view === 'groups' && hasActiveFilters && (
+                  <Button
+                    className={styles.expandAllButton}
+                    icon={expandAll ? 'angle-double-up' : 'angle-double-down'}
+                    variant="secondary"
+                    onClick={() => setExpandAll(!expandAll)}
+                  >
+                    {expandAll ? 'Collapse all' : 'Expand all'}
+                  </Button>
+                )}
+                <RuleStats namespaces={filteredNamespaces} />
+              </div>
+              <Stack direction="row" gap={0.5}>
+                <MoreActionsRuleButtons />
+              </Stack>
             </div>
-          ))}
-          {rulerRequestErrors.map(({ dataSource, error }) => (
-            <div key={dataSource.name}>
-              Failed to load rules config from <a href={'datasources/edit/${dataSource.id}'}>{dataSource.name}</a>:{' '}
-              {error.message || 'Unknown error.'}
-            </div>
-          ))}
-        </Alert>
-      )}
-      {!showNewAlertSplash && (
-        <>
-          <RulesFilter />
-          <div className={styles.break} />
-          <div className={styles.buttonsContainer}>
-            <ButtonGroup>
-              <a href={urlUtil.renderUrl('alerting/list', { ...queryParams, view: 'group' })}>
-                <ToolbarButton variant={view === 'groups' ? 'active' : 'default'} icon="folder">
-                  Groups
-                </ToolbarButton>
-              </a>
-              <a href={urlUtil.renderUrl('alerting/list', { ...queryParams, view: 'state' })}>
-                <ToolbarButton variant={view === 'state' ? 'active' : 'default'} icon="heart-rate">
-                  State
-                </ToolbarButton>
-              </a>
-            </ButtonGroup>
-            <div />
-            <a href={'alerting/new'}>
-              <Button icon="plus">New alert rule</Button>
-            </a>
-          </div>
-        </>
-      )}
-      {showNewAlertSplash && <NoRulesSplash />}
-      {haveResults && <ViewComponent namespaces={filteredNamespaces} />}
-    </AlertingPageWrapper>
-  );
-};
+          </>
+        )}
+        {hasNoAlertRulesCreatedYet && <NoRulesSplash />}
+        {!hasNoAlertRulesCreatedYet && <ViewComponent expandAll={expandAll} namespaces={filteredNamespaces} />}
+      </AlertingPageWrapper>
+    );
+  },
+  { style: 'page' }
+);
 
-const getStyles = (theme: GrafanaTheme) => ({
+const getStyles = (theme: GrafanaTheme2) => ({
   break: css`
     width: 100%;
     height: 0;
-    margin-bottom: ${theme.spacing.md};
-    border-bottom: solid 1px ${theme.colors.border2};
-  `,
-  iconError: css`
-    color: ${theme.palette.red};
-    margin-right: ${theme.spacing.md};
+    margin-bottom: ${theme.spacing(2)};
+    border-bottom: solid 1px ${theme.colors.border.medium};
   `,
   buttonsContainer: css`
-    margin-bottom: ${theme.spacing.md};
+    margin-bottom: ${theme.spacing(2)};
     display: flex;
     justify-content: space-between;
   `,
+  statsContainer: css`
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  `,
+  expandAllButton: css`
+    margin-right: ${theme.spacing(1)};
+  `,
 });
+
+export default RuleList;

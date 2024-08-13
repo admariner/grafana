@@ -1,16 +1,21 @@
 import { GrafanaTheme } from '../types/theme';
+
 import { ThemeBreakpoints } from './breakpoints';
-import { ThemeComponents } from './createComponents';
 import { ThemeColors } from './createColors';
+import { ThemeComponents } from './createComponents';
 import { ThemeShadows } from './createShadows';
 import { ThemeShape } from './createShape';
 import { ThemeSpacing } from './createSpacing';
 import { ThemeTransitions } from './createTransitions';
 import { ThemeTypography } from './createTypography';
+import { ThemeVisualizationColors } from './createVisualizationColors';
 import { ThemeZIndices } from './zIndex';
 
-/** @beta */
-export interface GrafanaThemeV2 {
+/**
+ * @beta
+ * Next gen theme model introduced in Grafana v8.
+ */
+export interface GrafanaTheme2 {
   name: string;
   isDark: boolean;
   isLight: boolean;
@@ -22,8 +27,12 @@ export interface GrafanaThemeV2 {
   typography: ThemeTypography;
   zIndex: ThemeZIndices;
   shadows: ThemeShadows;
+  visualization: ThemeVisualizationColors;
   transitions: ThemeTransitions;
+  /** @deprecated Will be removed in a future version */
   v1: GrafanaTheme;
+  /** feature flags that might impact component looks */
+  flags: {};
 }
 
 /** @alpha */
@@ -40,6 +49,8 @@ export interface ThemeRichColor {
   border: string;
   /** Used subtly colored backgrounds */
   transparent: string;
+  /** Used for weak colored borders like larger alert/banner boxes and smaller badges and tags */
+  borderTransparent: string;
   /** Text color for text ontop of main */
   contrastText: string;
 }

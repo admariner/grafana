@@ -1,3 +1,5 @@
+import { ThemeVisualizationColors } from '../themes';
+
 export enum GrafanaThemeType {
   Light = 'light',
   Dark = 'dark',
@@ -106,6 +108,7 @@ export interface GrafanaThemeCommons {
     tooltip: number;
     modalBackdrop: number;
     modal: number;
+    portal: number;
     typeahead: number;
   };
 }
@@ -238,4 +241,5 @@ export interface GrafanaTheme extends GrafanaThemeCommons {
   shadows: {
     listItem: string;
   };
+  visualization: ThemeVisualizationColors;
 }

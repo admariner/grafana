@@ -1,15 +1,27 @@
-import { GrafanaQuery, GrafanaAlertState } from 'app/types/unified-alerting-dto';
+import { AlertQuery, GrafanaAlertStateDecision } from 'app/types/unified-alerting-dto';
+
+import { Folder } from '../components/rule-editor/RuleFolderPicker';
 
 export enum RuleFormType {
-  threshold = 'threshold',
-  system = 'system',
+  grafana = 'grafana',
+  cloudAlerting = 'cloud-alerting',
+  cloudRecording = 'cloud-recording',
 }
 
-export enum TimeOptions {
-  seconds = 's',
-  minutes = 'm',
-  hours = 'h',
-  days = 'd',
+export interface ContactPoint {
+  selectedContactPoint: string;
+  overrideGrouping: boolean;
+  groupBy: string[];
+  overrideTimings: boolean;
+  groupWaitValue: string;
+  groupIntervalValue: string;
+  repeatIntervalValue: string;
+  muteTimeIntervals: string[];
+}
+
+// key: name of alert manager, value ContactPoint
+export interface AlertManagerManualRouting {
+  [key: string]: ContactPoint;
 }
 
 export interface RuleFormValues {
@@ -17,23 +29,28 @@ export interface RuleFormValues {
   name: string;
   type?: RuleFormType;
   dataSourceName: string | null;
+  group: string;
 
   labels: Array<{ key: string; value: string }>;
   annotations: Array<{ key: string; value: string }>;
 
-  // threshold alerts
-  queries: GrafanaQuery[];
+  // grafana rules
+  queries: AlertQuery[];
   condition: string | null; // refId of the query that gets alerted on
-  noDataState: GrafanaAlertState;
-  execErrState: GrafanaAlertState;
-  folder: { title: string; id: number } | null;
+  noDataState: GrafanaAlertStateDecision;
+  execErrState: GrafanaAlertStateDecision;
+  folder: Folder | null;
   evaluateEvery: string;
   evaluateFor: string;
+  isPaused?: boolean;
+  manualRouting: boolean; // if true contactPoints are used. This field will not be used for saving the rule
+  contactPoints?: AlertManagerManualRouting;
 
-  // system alerts
+  // cortex / loki rules
   namespace: string;
-  group: string;
   forTime: number;
   forTimeUnit: string;
+  keepFiringForTime?: number;
+  keepFiringForTimeUnit?: string;
   expression: string;
 }

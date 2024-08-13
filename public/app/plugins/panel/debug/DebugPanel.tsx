@@ -1,51 +1,30 @@
 import React, { Component } from 'react';
+
 import { PanelProps } from '@grafana/data';
 
-import { DebugPanelOptions, DebugMode, UpdateCounters } from './types';
+import { CursorView } from './CursorView';
 import { EventBusLoggerPanel } from './EventBusLogger';
 import { RenderInfoViewer } from './RenderInfoViewer';
+import { StateView } from './StateView';
+import { Options, DebugMode } from './panelcfg.gen';
 
-type Props = PanelProps<DebugPanelOptions>;
+type Props = PanelProps<Options>;
 
 export class DebugPanel extends Component<Props> {
-  // Intentionally not state to avoid overhead -- yes, things will be 1 tick behind
-  lastRender = Date.now();
-  counters: UpdateCounters = {
-    render: 0,
-    dataChanged: 0,
-    schemaChanged: 0,
-  };
-
-  shouldComponentUpdate(prevProps: Props) {
-    const { data, options } = this.props;
-
-    if (prevProps.data !== data) {
-      this.counters.dataChanged++;
-
-      if (options.counters?.schemaChanged) {
-        if (data.structureRev !== prevProps.data.structureRev) {
-          this.counters.schemaChanged++;
-        }
-      }
-    }
-    return true; // always render?
-  }
-
-  resetCounters = () => {
-    this.counters = {
-      render: 0,
-      dataChanged: 0,
-      schemaChanged: 0,
-    };
-    this.setState(this.state); // force update
-  };
-
   render() {
     const { options } = this.props;
-    if (options.mode === DebugMode.Events) {
-      return <EventBusLoggerPanel eventBus={this.props.eventBus} />;
-    }
 
-    return <RenderInfoViewer {...this.props} />;
+    switch (options.mode) {
+      case DebugMode.Events:
+        return <EventBusLoggerPanel eventBus={this.props.eventBus} />;
+      case DebugMode.Cursor:
+        return <CursorView eventBus={this.props.eventBus} />;
+      case DebugMode.State:
+        return <StateView {...this.props} />;
+      case DebugMode.ThrowError:
+        throw new Error('I failed you and for that i am deeply sorry');
+      default:
+        return <RenderInfoViewer {...this.props} />;
+    }
   }
 }

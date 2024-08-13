@@ -1,20 +1,22 @@
 import React, { PureComponent } from 'react';
 import { connect, MapDispatchToProps, MapStateToProps } from 'react-redux';
-import { Alert, Button, ConfirmModal, Container, CustomScrollbar, HorizontalGroup, IconName, Modal } from '@grafana/ui';
+
+import { EventBusSrv } from '@grafana/data';
 import { selectors } from '@grafana/e2e-selectors';
-import { AngularComponent, getAngularLoader, getDataSourceSrv } from '@grafana/runtime';
-import { getAlertingValidationMessage } from './getAlertingValidationMessage';
-
+import { AngularComponent, config, getAngularLoader, getDataSourceSrv } from '@grafana/runtime';
+import { Alert, Button, ConfirmModal, Container, CustomScrollbar, HorizontalGroup, Modal } from '@grafana/ui';
 import EmptyListCTA from 'app/core/components/EmptyListCTA/EmptyListCTA';
-import StateHistory from './StateHistory';
-import 'app/features/alerting/AlertTabCtrl';
+import { getPanelStateForModel } from 'app/features/panel/state/selectors';
+import { AppNotificationSeverity, StoreState } from 'app/types';
 
+import { AlertState } from '../../plugins/datasource/alertmanager/types';
+import { PanelNotSupported } from '../dashboard/components/PanelEditor/PanelNotSupported';
 import { DashboardModel } from '../dashboard/state/DashboardModel';
 import { PanelModel } from '../dashboard/state/PanelModel';
+
+import StateHistory from './StateHistory';
 import { TestRuleResult } from './TestRuleResult';
-import { AppNotificationSeverity, StoreState } from 'app/types';
-import { PanelNotSupported } from '../dashboard/components/PanelEditor/PanelNotSupported';
-import { AlertState } from '../../plugins/datasource/alertmanager/types';
+import { getAlertingValidationMessage } from './getAlertingValidationMessage';
 
 interface AngularPanelController {
   _enableAlert: () => void;
@@ -55,8 +57,14 @@ class UnConnectedAlertTab extends PureComponent<Props, State> {
     showTestRule: false,
   };
 
-  componentDidMount() {
-    this.loadAlertTab();
+  async componentDidMount() {
+    if (config.angularSupportEnabled) {
+      await import(/* webpackChunkName: "AlertTabCtrl" */ 'app/features/alerting/AlertTabCtrl');
+      this.loadAlertTab();
+    } else {
+      // TODO probably need to migrate AlertTab to react
+      alert('Angular support disabled, legacy alerting cannot function without angular support');
+    }
   }
 
   onAngularPanelUpdated = () => {
@@ -76,24 +84,28 @@ class UnConnectedAlertTab extends PureComponent<Props, State> {
   async loadAlertTab() {
     const { panel, angularPanelComponent } = this.props;
 
-    if (!this.element || !angularPanelComponent || this.component) {
+    if (!this.element || this.component) {
       return;
     }
 
-    const scope = angularPanelComponent.getScope();
+    if (angularPanelComponent) {
+      const scope = angularPanelComponent.getScope();
 
-    // When full page reloading in edit mode the angular panel has on fully compiled & instantiated yet
-    if (!scope.$$childHead) {
-      setTimeout(() => {
-        this.forceUpdate();
-      });
-      return;
+      // When full page reloading in edit mode the angular panel has on fully compiled & instantiated yet
+      if (!scope.$$childHead) {
+        setTimeout(() => {
+          this.forceUpdate();
+        });
+        return;
+      }
+
+      this.panelCtrl = scope.$$childHead.ctrl;
+    } else {
+      this.panelCtrl = this.getReactAlertPanelCtrl();
     }
 
-    this.panelCtrl = scope.$$childHead.ctrl;
     const loader = getAngularLoader();
     const template = '<alert-tab />';
-
     const scopeProps = { ctrl: this.panelCtrl };
 
     this.component = loader.load(this.element, scopeProps, template);
@@ -108,6 +120,16 @@ class UnConnectedAlertTab extends PureComponent<Props, State> {
     if (validationMessage) {
       this.setState({ validationMessage });
     }
+  }
+
+  getReactAlertPanelCtrl() {
+    return {
+      panel: this.props.panel,
+      events: new EventBusSrv(),
+      render: () => {
+        this.props.panel.render();
+      },
+    } as any;
   }
 
   onAddAlert = () => {
@@ -182,11 +204,7 @@ class UnConnectedAlertTab extends PureComponent<Props, State> {
 
     return (
       <Modal isOpen={true} icon="history" title="State history" onDismiss={onDismiss} onClickBackdrop={onDismiss}>
-        <StateHistory
-          dashboard={dashboard}
-          panelId={panel.editSourceId ?? panel.id}
-          onRefresh={() => this.panelCtrl?.refresh()}
-        />
+        <StateHistory dashboard={dashboard} panelId={panel.id} onRefresh={() => this.panelCtrl?.refresh()} />
       </Modal>
     );
   };
@@ -202,7 +220,7 @@ class UnConnectedAlertTab extends PureComponent<Props, State> {
 
     const model = {
       title: 'Panel has no alert rule defined',
-      buttonIcon: 'bell' as IconName,
+      buttonIcon: 'bell' as const,
       onClick: this.onAddAlert,
       buttonTitle: 'Create Alert',
     };
@@ -211,7 +229,7 @@ class UnConnectedAlertTab extends PureComponent<Props, State> {
       <>
         <CustomScrollbar autoHeightMin="100%">
           <Container padding="md">
-            <div aria-label={selectors.components.AlertTab.content}>
+            <div data-testid={selectors.components.AlertTab.content}>
               {alert && hasTransformations && (
                 <Alert
                   severity={AppNotificationSeverity.Error}
@@ -248,7 +266,7 @@ class UnConnectedAlertTab extends PureComponent<Props, State> {
 
 const mapStateToProps: MapStateToProps<ConnectedProps, OwnProps, StoreState> = (state, props) => {
   return {
-    angularPanelComponent: state.dashboard.panels[props.panel.id].angularComponent,
+    angularPanelComponent: getPanelStateForModel(state, props.panel)?.angularComponent,
   };
 };
 

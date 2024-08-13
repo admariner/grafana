@@ -1,15 +1,39 @@
 import { compact, each, findIndex, flatten, get, join, keyBy, last, map, reduce, without } from 'lodash';
-import { arrayMove } from 'app/core/utils/arrayMove';
-import { Parser } from './parser';
-import { TemplateSrv } from '@grafana/runtime';
+
 import { ScopedVars } from '@grafana/data';
+import { TemplateSrv } from '@grafana/runtime';
+import { arrayMove } from 'app/core/utils/arrayMove';
+
+import { GraphiteDatasource } from './datasource';
+import { FuncInstance } from './gfunc';
+import { AstNode, Parser } from './parser';
+import { GraphiteSegment } from './types';
+
+export type GraphiteTagOperator = '=' | '=~' | '!=' | '!=~';
+
+export type GraphiteTag = {
+  key: string;
+  operator: GraphiteTagOperator;
+  value: string;
+};
+
+export type GraphiteTarget = {
+  refId: string | number;
+  target: string;
+  /**
+   * Contains full query after interpolating sub-queries (e.g. "function(#A)" referencing query with refId=A)
+   */
+  targetFull: string;
+  textEditor: boolean;
+  paused: boolean;
+};
 
 export default class GraphiteQuery {
-  datasource: any;
-  target: any;
-  functions: any[] = [];
-  segments: any[] = [];
-  tags: any[] = [];
+  datasource: GraphiteDatasource;
+  target: GraphiteTarget;
+  functions: FuncInstance[] = [];
+  segments: GraphiteSegment[] = [];
+  tags: GraphiteTag[] = [];
   error: any;
   seriesByTagUsed = false;
   checkOtherSegmentsIndex = 0;
@@ -17,7 +41,6 @@ export default class GraphiteQuery {
   templateSrv: any;
   scopedVars: any;
 
-  /** @ngInject */
   constructor(datasource: any, target: any, templateSrv?: TemplateSrv, scopedVars?: ScopedVars) {
     this.datasource = datasource;
     this.target = target;
@@ -55,8 +78,10 @@ export default class GraphiteQuery {
     try {
       this.parseTargetRecursive(astNode, null);
     } catch (err) {
-      console.error('error parsing target:', err.message);
-      this.error = err.message;
+      if (err instanceof Error) {
+        console.error('error parsing target:', err.message);
+        this.error = err.message;
+      }
       this.target.textEditor = true;
     }
 
@@ -85,6 +110,10 @@ export default class GraphiteQuery {
         const innerFunc = this.datasource.createFuncInstance(astNode.name, {
           withDefaultParams: false,
         });
+
+        // bug fix for parsing multiple functions as params
+        handleMultipleSeriesByTagsParams(astNode);
+
         each(astNode.params, (param) => {
           this.parseTargetRecursive(param, innerFunc);
         });
@@ -130,11 +159,11 @@ export default class GraphiteQuery {
     this.segments.push({ value: 'select metric' });
   }
 
-  addFunction(newFunc: any) {
+  addFunction(newFunc: FuncInstance) {
     this.functions.push(newFunc);
   }
 
-  addFunctionParameter(func: any, value: string) {
+  addFunctionParameter(func: FuncInstance, value: string) {
     if (func.params.length >= func.def.params.length && !get(last(func.def.params), 'multiple', false)) {
       throw { message: 'too many parameters for function ' + func.def.name };
     }
@@ -145,20 +174,20 @@ export default class GraphiteQuery {
     this.functions = without(this.functions, func);
   }
 
-  moveFunction(func: any, offset: number) {
+  moveFunction(func: FuncInstance, offset: number) {
     const index = this.functions.indexOf(func);
     arrayMove(this.functions, index, index + offset);
   }
 
   updateModelTarget(targets: any) {
-    const wrapFunction = (target: string, func: any) => {
+    const wrapFunction = (target: string, func: FuncInstance) => {
       return func.render(target, (value: string) => {
         return this.templateSrv.replace(value, this.scopedVars);
       });
     };
 
     if (!this.target.textEditor) {
-      const metricPath = this.getSegmentPathUpTo(this.segments.length).replace(/\.select metric$/, '');
+      const metricPath = this.getSegmentPathUpTo(this.segments.length).replace(/\.?select metric$/, '');
       this.target.target = reduce(this.functions, wrapFunction, metricPath);
     }
 
@@ -170,6 +199,9 @@ export default class GraphiteQuery {
         this.updateRenderedTarget(target, targets);
       }
     }
+
+    // clean-up added param
+    this.functions.forEach((func) => (func.added = false));
   }
 
   updateRenderedTarget(target: { refId: string | number; target: any; targetFull: any }, targets: any) {
@@ -183,19 +215,10 @@ export default class GraphiteQuery {
     let targetWithNestedQueries = target.target;
 
     // Use ref count to track circular references
-    function countTargetRefs(targetsByRefId: any, refId: string) {
-      let refCount = 0;
-      each(targetsByRefId, (t, id) => {
-        if (id !== refId) {
-          const match = nestedSeriesRefRegex.exec(t.target);
-          const count = match && match.length ? match.length - 1 : 0;
-          refCount += count;
-        }
-      });
-      targetsByRefId[refId].refCount = refCount;
-    }
     each(targetsByRefId, (t, id) => {
-      countTargetRefs(targetsByRefId, id);
+      const regex = RegExp(`\#(${id})`, 'g');
+      const refMatches = targetWithNestedQueries.match(regex);
+      t.refCount = refMatches?.length ?? 0;
     });
 
     // Keep interpolating until there are no query references
@@ -239,7 +262,7 @@ export default class GraphiteQuery {
           if (tag.length === 3) {
             return {
               key: tag[0],
-              operator: tag[1],
+              operator: tag[1] as GraphiteTagOperator,
               value: tag[2],
             };
           }
@@ -262,27 +285,31 @@ export default class GraphiteQuery {
     }
   }
 
-  addTag(tag: { key: any; operator: string; value: string }) {
+  addTag(tag: { key: any; operator: GraphiteTagOperator; value: string }) {
     const newTagParam = renderTagString(tag);
-    this.getSeriesByTagFunc().params.push(newTagParam);
+    this.getSeriesByTagFunc()!.params.push(newTagParam);
     this.tags.push(tag);
   }
 
   removeTag(index: number) {
-    this.getSeriesByTagFunc().params.splice(index, 1);
+    this.getSeriesByTagFunc()!.params.splice(index, 1);
     this.tags.splice(index, 1);
   }
 
-  updateTag(tag: { key: string }, tagIndex: number) {
+  updateTag(tag: { key: string; operator: GraphiteTagOperator; value: string }, tagIndex: number) {
     this.error = null;
 
     if (tag.key === this.removeTagValue) {
       this.removeTag(tagIndex);
+      if (this.tags.length === 0) {
+        this.removeFunction(this.getSeriesByTagFunc());
+        this.checkOtherSegmentsIndex = 0;
+        this.seriesByTagUsed = false;
+      }
       return;
     }
 
-    const newTagParam = renderTagString(tag);
-    this.getSeriesByTagFunc().params[tagIndex] = newTagParam;
+    this.getSeriesByTagFunc()!.params[tagIndex] = renderTagString(tag);
     this.tags[tagIndex] = tag;
   }
 
@@ -292,6 +319,8 @@ export default class GraphiteQuery {
         // Don't render tag that we want to lookup
         if (index !== excludeIndex) {
           return tagExpr.key + tagExpr.operator + tagExpr.value;
+        } else {
+          return undefined;
         }
       })
     );
@@ -300,4 +329,41 @@ export default class GraphiteQuery {
 
 function renderTagString(tag: { key: any; operator?: any; value?: any }) {
   return tag.key + tag.operator + tag.value;
+}
+
+/**
+ * mutates the second seriesByTag function into a string to fix a parsing bug
+ * @param astNode
+ * @param innerFunc
+ */
+function handleMultipleSeriesByTagsParams(astNode: AstNode) {
+  // if function has two params that are function seriesByTags keep the second as a string otherwise we have a parsing error
+  if (astNode.params && astNode.params.length >= 2) {
+    let count = 0;
+    astNode.params = astNode.params.map((p: AstNode) => {
+      if (p.type === 'function') {
+        count += 1;
+      }
+
+      if (count === 2 && p.type === 'function' && p.name === 'seriesByTag') {
+        // convert second function to a string
+        const stringParams =
+          p.params &&
+          p.params.reduce((acc: string, p: AstNode, idx: number, paramsArr: AstNode[]) => {
+            if (idx === 0 || idx !== paramsArr.length - 1) {
+              return `${acc}'${p.value}',`;
+            }
+
+            return `${acc}'${p.value}'`;
+          }, '');
+
+        return {
+          type: 'string',
+          value: `${p.name}(${stringParams})`,
+        };
+      }
+
+      return p;
+    });
+  }
 }

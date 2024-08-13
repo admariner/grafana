@@ -1,27 +1,45 @@
 import { assign, each, filter, forEach, get, includes, isString, last, map, toString, isFinite } from 'lodash';
-import { isVersionGtOrEq } from 'app/core/utils/version';
-import { InterpolateFunction } from '@grafana/data';
 
-const index: any = {};
+import { InterpolateFunction } from '@grafana/data';
+import { isVersionGtOrEq } from 'app/core/utils/version';
+
+export type ParamDef = {
+  name: string;
+  type: string;
+  options?: Array<string | number>;
+  multiple?: boolean;
+  optional?: boolean;
+  version?: string;
+};
 
 export interface FuncDef {
-  name: any;
+  name: string;
+  params: ParamDef[];
+  defaultParams: Array<string | number>;
   category?: string;
-  params?: any;
-  defaultParams?: any;
   shortName?: any;
   fake?: boolean;
   version?: string;
   description?: string;
+  /**
+   * True if the function was not found on the list of available function descriptions.
+   */
+  unknown?: boolean;
 }
 
-function addFuncDef(funcDef: FuncDef) {
+export type FuncDefs = {
+  [functionName in string]: FuncDef;
+};
+
+const index: FuncDefs = {};
+
+function addFuncDef(funcDef: Partial<FuncDef> & { name: string; category: string }) {
   funcDef.params = funcDef.params || [];
   funcDef.defaultParams = funcDef.defaultParams || [];
 
-  index[funcDef.name] = funcDef;
+  index[funcDef.name] = funcDef as FuncDef;
   if (funcDef.shortName) {
-    index[funcDef.shortName] = funcDef;
+    index[funcDef.shortName] = funcDef as FuncDef;
   }
 }
 
@@ -965,21 +983,32 @@ addFuncDef({
   version: '1.1',
 });
 
-function isVersionRelatedFunction(obj: { version: string }, graphiteVersion: string) {
+function isVersionRelatedFunction(obj: { version?: string }, graphiteVersion: string) {
   return !obj.version || isVersionGtOrEq(graphiteVersion, obj.version);
 }
 
 export class FuncInstance {
-  def: any;
-  params: any;
+  def: FuncDef;
+  params: Array<string | number>;
   text: any;
-  added: boolean;
+  /**
+   * True if this function was just added and not edited yet. It's used to focus on first
+   * function param to edit it straight away after adding a function.
+   */
+  declare added: boolean;
+  /**
+   * Hidden functions are not displayed in UI but available in text editor
+   * This is used for seriesByTagUsed function which when used switches
+   * the editor to tag-only mode. Defined tags are provided to seriesByTagUsed
+   * as parameters.
+   */
+  hidden?: boolean;
 
-  constructor(funcDef: any, options?: { withDefaultParams: any }) {
+  constructor(funcDef: FuncDef, options?: { withDefaultParams: any }) {
     this.def = funcDef;
     this.params = [];
 
-    if (options && options.withDefaultParams) {
+    if (options && options.withDefaultParams && funcDef.defaultParams) {
       this.params = funcDef.defaultParams.slice(0);
     }
 
@@ -999,7 +1028,13 @@ export class FuncInstance {
       }
 
       // param types that should never be quoted
-      if (includes(['value_or_series', 'boolean', 'int', 'float', 'node', 'int_or_infinity'], paramType)) {
+      const neverQuotedParams = ['value_or_series', 'boolean', 'int', 'float', 'node', 'int_or_infinity'];
+
+      // functions that should not have param types quoted
+      // https://github.com/grafana/grafana/issues/54924
+      const neverQuotedFunctions = ['asPercent'];
+      // params or functions that should never be quoted
+      if (includes(neverQuotedParams, paramType) || includes(neverQuotedFunctions, this.def.name)) {
         return value;
       }
 
@@ -1026,7 +1061,7 @@ export class FuncInstance {
     return str + parameters.join(', ') + ')';
   }
 
-  _hasMultipleParamsInString(strValue: any, index: number) {
+  _hasMultipleParamsInString(strValue: string, index: number) {
     if (strValue.indexOf(',') === -1) {
       return false;
     }
@@ -1042,7 +1077,7 @@ export class FuncInstance {
     return false;
   }
 
-  updateParam(strValue: any, index: any) {
+  updateParam(strValue: string, index: number) {
     // handle optional parameters
     // if string contains ',' and next param is optional, split and update both
     if (this._hasMultipleParamsInString(strValue, index)) {
@@ -1074,23 +1109,23 @@ export class FuncInstance {
   }
 }
 
-function createFuncInstance(funcDef: any, options?: { withDefaultParams: any }, idx?: any) {
+function createFuncInstance(funcDef: FuncDef | string, options?: { withDefaultParams: any }, idx?: any): FuncInstance {
   if (isString(funcDef)) {
     funcDef = getFuncDef(funcDef, idx);
   }
   return new FuncInstance(funcDef, options);
 }
 
-function getFuncDef(name: string, idx?: any) {
+function getFuncDef(name: string, idx?: any): FuncDef {
   if (!(idx || index)[name]) {
-    return { name: name, params: [{ multiple: true }], unknown: true };
+    return { name: name, params: [{ name: '', type: '', multiple: true }], defaultParams: [''], unknown: true };
   }
   return (idx || index)[name];
 }
 
-function getFuncDefs(graphiteVersion: string, idx?: any) {
-  const funcs: any = {};
-  forEach(idx || index, (funcDef) => {
+function getFuncDefs(graphiteVersion: string, idx?: any): FuncDefs {
+  const funcs: FuncDefs = {};
+  forEach(idx || index, (funcDef: FuncDef) => {
     if (isVersionRelatedFunction(funcDef, graphiteVersion)) {
       funcs[funcDef.name] = assign({}, funcDef, {
         params: filter(funcDef.params, (param) => {
@@ -1103,8 +1138,8 @@ function getFuncDefs(graphiteVersion: string, idx?: any) {
 }
 
 // parse response from graphite /functions endpoint into internal format
-function parseFuncDefs(rawDefs: any) {
-  const funcDefs: any = {};
+function parseFuncDefs(rawDefs: any): FuncDefs {
+  const funcDefs: FuncDefs = {};
 
   forEach(rawDefs || {}, (funcDef, funcName) => {
     // skip graphite graph functions

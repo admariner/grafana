@@ -1,35 +1,16 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
 import { isNumber, sortBy, toLower, uniqBy } from 'lodash';
-import { DataSourceApi, MetricFindValue, stringToJsRegex } from '@grafana/data';
 
-import {
-  initialVariableModelState,
-  QueryVariableModel,
-  VariableOption,
-  VariableQueryEditorType,
-  VariableRefresh,
-  VariableSort,
-} from '../types';
+import { MetricFindValue, stringToJsRegex } from '@grafana/data';
 
-import {
-  ALL_VARIABLE_TEXT,
-  ALL_VARIABLE_VALUE,
-  getInstanceState,
-  initialVariablesState,
-  NONE_VARIABLE_TEXT,
-  NONE_VARIABLE_VALUE,
-  VariablePayload,
-  VariablesState,
-} from '../state/types';
+import { ALL_VARIABLE_TEXT, ALL_VARIABLE_VALUE, NONE_VARIABLE_TEXT, NONE_VARIABLE_VALUE } from '../constants';
+import { getInstanceState } from '../state/selectors';
+import { initialVariablesState, VariablePayload, VariablesState } from '../state/types';
+import { initialVariableModelState, QueryVariableModel, VariableOption, VariableRefresh, VariableSort } from '../types';
 
 interface VariableOptionsUpdate {
   templatedRegex: string;
   results: MetricFindValue[];
-}
-
-export interface QueryVariableEditorState {
-  VariableQueryEditor: VariableQueryEditorType;
-  dataSource: DataSourceApi | null;
 }
 
 export const initialQueryVariableModelState: QueryVariableModel = {
@@ -44,7 +25,7 @@ export const initialQueryVariableModelState: QueryVariableModel = {
   includeAll: false,
   allValue: null,
   options: [],
-  current: {} as VariableOption,
+  current: {},
   definition: '',
 };
 
@@ -74,6 +55,18 @@ export const sortVariableValues = (options: any[], sortOrder: VariableSort) => {
   } else if (sortType === 3) {
     options = sortBy(options, (opt) => {
       return toLower(opt.text);
+    });
+  } else if (sortType === 4) {
+    options.sort((a, b) => {
+      if (!a.text) {
+        return -1;
+      }
+
+      if (!b.text) {
+        return 1;
+      }
+
+      return a.text.localeCompare(b.text, undefined, { numeric: true });
     });
   }
 
@@ -160,7 +153,11 @@ export const queryVariableSlice = createSlice({
   reducers: {
     updateVariableOptions: (state: VariablesState, action: PayloadAction<VariablePayload<VariableOptionsUpdate>>) => {
       const { results, templatedRegex } = action.payload.data;
-      const instanceState = getInstanceState<QueryVariableModel>(state, action.payload.id);
+      const instanceState = getInstanceState(state, action.payload.id);
+      if (instanceState.type !== 'query') {
+        return;
+      }
+
       const { includeAll, sort } = instanceState;
       const options = metricNamesToVariableValues(templatedRegex, sort, results);
 

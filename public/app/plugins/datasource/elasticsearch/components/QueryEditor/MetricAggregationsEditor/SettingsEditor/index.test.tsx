@@ -1,10 +1,13 @@
-import React from 'react';
 import { fireEvent, render, screen } from '@testing-library/react';
-import { SettingsEditor } from '.';
-import { ElasticsearchProvider } from '../../ElasticsearchQueryContext';
+import React from 'react';
+
+import { getDefaultTimeRange } from '@grafana/data';
+
 import { ElasticDatasource } from '../../../../datasource';
 import { ElasticsearchQuery } from '../../../../types';
-import { getDefaultTimeRange } from '@grafana/data';
+import { ElasticsearchProvider } from '../../ElasticsearchQueryContext';
+
+import { SettingsEditor } from '.';
 
 describe('Settings Editor', () => {
   describe('Raw Data', () => {
@@ -80,6 +83,47 @@ describe('Settings Editor', () => {
       });
       expect(settingsButtonEl).toBeInTheDocument();
       expect(settingsButtonEl.textContent).toBe(`Size: ${newSizeValue}`);
+    });
+  });
+
+  describe('Rate aggregation', () => {
+    it('should render correct settings', () => {
+      const metricId = '1';
+      const query: ElasticsearchQuery = {
+        refId: 'A',
+        query: '',
+        metrics: [
+          {
+            id: metricId,
+            type: 'rate',
+            settings: {},
+          },
+        ],
+        bucketAggs: [],
+      };
+
+      const onChange = jest.fn();
+
+      render(
+        <ElasticsearchProvider
+          query={query}
+          datasource={{} as ElasticDatasource}
+          onChange={onChange}
+          onRunQuery={() => {}}
+          range={getDefaultTimeRange()}
+        >
+          <SettingsEditor metric={query.metrics![0]} previousMetrics={[]} />
+        </ElasticsearchProvider>
+      );
+
+      let settingsButtonEl = screen.getByRole('button');
+      fireEvent.click(settingsButtonEl);
+
+      const unitSelectElement = screen.getByTestId('unit-select');
+      const modeSelectElement = screen.getByTestId('mode-select');
+
+      expect(unitSelectElement).toBeInTheDocument();
+      expect(modeSelectElement).toBeInTheDocument();
     });
   });
 });

@@ -1,7 +1,8 @@
 import { GrafanaTheme, GrafanaThemeCommons, GrafanaThemeType } from '../types';
-import { GrafanaThemeV2 } from './types';
 
-export function createV1Theme(theme: Omit<GrafanaThemeV2, 'v1'>): GrafanaTheme {
+import { GrafanaTheme2 } from './types';
+
+export function createV1Theme(theme: Omit<GrafanaTheme2, 'v1'>): GrafanaTheme {
   const oldCommon: GrafanaThemeCommons = {
     name: 'Grafana Default',
     typography: {
@@ -98,15 +99,7 @@ export function createV1Theme(theme: Omit<GrafanaThemeV2, 'v1'>): GrafanaTheme {
     },
     panelPadding: theme.components.panel.padding * theme.spacing.gridSize,
     panelHeaderHeight: theme.spacing.gridSize * theme.components.panel.headerHeight,
-    zIndex: {
-      navbarFixed: theme.zIndex.navbarFixed,
-      sidemenu: theme.zIndex.sidemenu,
-      dropdown: theme.zIndex.dropdown,
-      typeahead: theme.zIndex.typeahead,
-      tooltip: theme.zIndex.tooltip,
-      modalBackdrop: theme.zIndex.modalBackdrop,
-      modal: theme.zIndex.modal,
-    },
+    zIndex: theme.zIndex,
   };
 
   const basicColors = {
@@ -194,16 +187,16 @@ export function createV1Theme(theme: Omit<GrafanaThemeV2, 'v1'>): GrafanaTheme {
     palette: {
       ...basicColors,
       brandPrimary: basicColors.orange,
-      brandSuccess: basicColors.greenBase,
-      brandWarning: basicColors.orange,
-      brandDanger: basicColors.redBase,
-      queryRed: basicColors.redBase,
-      queryGreen: '#74e680',
+      brandSuccess: theme.colors.success.main,
+      brandWarning: theme.colors.warning.main,
+      brandDanger: theme.colors.error.main,
+      queryRed: theme.colors.error.text,
+      queryGreen: theme.colors.success.text,
       queryPurple: '#fe85fc',
       queryOrange: basicColors.orange,
-      online: basicColors.greenBase,
-      warn: '#f79520',
-      critical: basicColors.redBase,
+      online: theme.colors.success.main,
+      warn: theme.colors.success.main,
+      critical: theme.colors.success.main,
     },
     colors: {
       ...backgrounds,
@@ -229,6 +222,7 @@ export function createV1Theme(theme: Omit<GrafanaThemeV2, 'v1'>): GrafanaTheme {
     shadows: {
       listItem: 'none',
     },
+    visualization: theme.visualization,
   };
 }
 

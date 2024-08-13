@@ -1,10 +1,16 @@
-import React from 'react';
 import { Global } from '@emotion/react';
-import { useTheme2 } from '..';
-import { getElementStyles } from './elements';
-import { getCardStyles } from './card';
+import React from 'react';
+
+import { useTheme2 } from '../ThemeContext';
+
 import { getAgularPanelStyles } from './angularPanelStyles';
+import { getCardStyles } from './card';
+import { getElementStyles } from './elements';
+import { getExtraStyles } from './extra';
+import { getFormElementStyles } from './forms';
+import { getMarkdownStyles } from './markdownStyles';
 import { getPageStyles } from './page';
+import { getSkeletonStyles } from './skeletonStyles';
 
 /** @internal */
 export function GlobalStyles() {
@@ -12,7 +18,16 @@ export function GlobalStyles() {
 
   return (
     <Global
-      styles={[getElementStyles(theme), getPageStyles(theme), getCardStyles(theme), getAgularPanelStyles(theme)]}
+      styles={[
+        getElementStyles(theme),
+        getExtraStyles(theme),
+        getFormElementStyles(theme),
+        getPageStyles(theme),
+        getCardStyles(theme),
+        getAgularPanelStyles(theme),
+        getMarkdownStyles(theme),
+        getSkeletonStyles(theme),
+      ]}
     />
   );
 }

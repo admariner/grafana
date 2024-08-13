@@ -1,20 +1,21 @@
-import React, { HTMLProps, useEffect } from 'react';
-import { useForm, Mode, DeepPartial, UnpackNestedValue, SubmitHandler } from 'react-hook-form';
-import { FormAPI } from '../../types';
 import { css } from '@emotion/css';
+import React, { HTMLProps, useEffect } from 'react';
+import { useForm, Mode, DefaultValues, SubmitHandler, FieldValues } from 'react-hook-form';
 
-interface FormProps<T> extends Omit<HTMLProps<HTMLFormElement>, 'onSubmit'> {
+import { FormAPI } from '../../types';
+
+interface FormProps<T extends FieldValues> extends Omit<HTMLProps<HTMLFormElement>, 'onSubmit' | 'children'> {
   validateOn?: Mode;
   validateOnMount?: boolean;
   validateFieldsOnMount?: string | string[];
-  defaultValues?: UnpackNestedValue<DeepPartial<T>>;
+  defaultValues?: DefaultValues<T>;
   onSubmit: SubmitHandler<T>;
   children: (api: FormAPI<T>) => React.ReactNode;
   /** Sets max-width for container. Use it instead of setting individual widths on inputs.*/
   maxWidth?: number | 'none';
 }
 
-export function Form<T>({
+export function Form<T extends FieldValues>({
   defaultValues,
   onSubmit,
   validateOnMount = false,
@@ -24,7 +25,7 @@ export function Form<T>({
   maxWidth = 600,
   ...htmlProps
 }: FormProps<T>) {
-  const { handleSubmit, register, control, trigger, getValues, formState, watch, setValue } = useForm<T>({
+  const { handleSubmit, trigger, formState, ...rest } = useForm<T>({
     mode: validateOn,
     defaultValues,
   });
@@ -38,14 +39,14 @@ export function Form<T>({
 
   return (
     <form
-      className={css`
-        max-width: ${maxWidth !== 'none' ? maxWidth + 'px' : maxWidth};
-        width: 100%;
-      `}
+      className={css({
+        maxWidth: maxWidth !== 'none' ? maxWidth + 'px' : maxWidth,
+        width: '100%',
+      })}
       onSubmit={handleSubmit(onSubmit)}
       {...htmlProps}
     >
-      {children({ register, errors: formState.errors, control, getValues, formState, watch, setValue })}
+      {children({ errors: formState.errors, formState, trigger, ...rest })}
     </form>
   );
 }

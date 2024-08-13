@@ -1,17 +1,26 @@
+import { isArray, omit, pick, isNil, omitBy } from 'lodash';
+
 import {
   AlertManagerCortexConfig,
+  AlertmanagerReceiver,
+  GrafanaManagedContactPoint,
   GrafanaManagedReceiverConfig,
   Receiver,
   Route,
 } from 'app/plugins/datasource/alertmanager/types';
-import { NotifierDTO, NotifierType } from 'app/types';
-import { GrafanaChannelValues, ReceiverFormValues } from '../types/receiver-form';
+import { CloudNotifierType, NotifierDTO, NotifierType } from 'app/types';
 
-// id to notifier
-type GrafanaChannelMap = Record<string, GrafanaManagedReceiverConfig>;
+import {
+  CloudChannelConfig,
+  CloudChannelMap,
+  CloudChannelValues,
+  GrafanaChannelMap,
+  GrafanaChannelValues,
+  ReceiverFormValues,
+} from '../types/receiver-form';
 
 export function grafanaReceiverToFormValues(
-  receiver: Receiver,
+  receiver: GrafanaManagedContactPoint,
   notifiers: NotifierDTO[]
 ): [ReceiverFormValues<GrafanaChannelValues>, GrafanaChannelMap] {
   const channelMap: GrafanaChannelMap = {};
@@ -32,18 +41,84 @@ export function grafanaReceiverToFormValues(
   return [values, channelMap];
 }
 
+export function cloudReceiverToFormValues(
+  receiver: Receiver,
+  notifiers: NotifierDTO[]
+): [ReceiverFormValues<CloudChannelValues>, CloudChannelMap] {
+  const channelMap: CloudChannelMap = {};
+  // giving each form receiver item a unique id so we can use it to map back to "original" items
+  let idCounter = 1;
+  const items: CloudChannelValues[] = Object.entries(receiver)
+    // filter out only config items that are relevant to cloud
+    .filter(([type]) => type.endsWith('_configs') && type !== 'grafana_managed_receiver_configs')
+    // map property names to cloud notifier types by removing the `_config` suffix
+    .map(([type, configs]): [CloudNotifierType, CloudChannelConfig[]] => [
+      type.replace('_configs', '') as CloudNotifierType,
+      configs,
+    ])
+    // convert channel configs to form values
+    .map(([type, configs]) =>
+      configs.map((config) => {
+        const id = String(idCounter++);
+        channelMap[id] = { type, config };
+        const notifier = notifiers.find((notifier) => notifier.type === type);
+        if (!notifier) {
+          throw new Error(`unknown cloud notifier: ${type}`);
+        }
+        return cloudChannelConfigToFormChannelValues(id, type, config);
+      })
+    )
+    .flat();
+  const values = {
+    name: receiver.name,
+    items,
+  };
+  return [values, channelMap];
+}
+
 export function formValuesToGrafanaReceiver(
   values: ReceiverFormValues<GrafanaChannelValues>,
   channelMap: GrafanaChannelMap,
-  defaultChannelValues: GrafanaChannelValues
+  defaultChannelValues: GrafanaChannelValues,
+  notifiers: NotifierDTO[]
 ): Receiver {
   return {
     name: values.name,
     grafana_managed_receiver_configs: (values.items ?? []).map((channelValues) => {
       const existing: GrafanaManagedReceiverConfig | undefined = channelMap[channelValues.__id];
-      return formChannelValuesToGrafanaChannelConfig(channelValues, defaultChannelValues, values.name, existing);
+      const notifier = notifiers.find((notifier) => notifier.type === channelValues.type);
+
+      return formChannelValuesToGrafanaChannelConfig(
+        channelValues,
+        defaultChannelValues,
+        values.name,
+        existing,
+        notifier
+      );
     }),
   };
+}
+
+export function formValuesToCloudReceiver(
+  values: ReceiverFormValues<CloudChannelValues>,
+  defaults: CloudChannelValues
+): Receiver {
+  const recv: AlertmanagerReceiver = {
+    name: values.name,
+  };
+  values.items.forEach(({ __id, type, settings, sendResolved }) => {
+    const channel = omitEmptyValues({
+      ...settings,
+      send_resolved: sendResolved ?? defaults.sendResolved,
+    });
+
+    if (!(`${type}_configs` in recv)) {
+      recv[`${type}_configs`] = [channel];
+    } else {
+      recv[`${type}_configs`]?.push(channel);
+    }
+  });
+  return recv;
 }
 
 // will add new receiver, or replace exisitng one
@@ -102,6 +177,23 @@ function renameReceiverInRoute(route: Route, oldName: string, newName: string) {
   return updated;
 }
 
+function cloudChannelConfigToFormChannelValues(
+  id: string,
+  type: CloudNotifierType,
+  channel: CloudChannelConfig
+): CloudChannelValues {
+  return {
+    __id: id,
+    type,
+    settings: {
+      ...channel,
+    },
+    secureFields: {},
+    secureSettings: {},
+    sendResolved: channel.send_resolved,
+  };
+}
+
 function grafanaChannelConfigToFormChannelValues(
   id: string,
   channel: GrafanaManagedReceiverConfig,
@@ -110,45 +202,93 @@ function grafanaChannelConfigToFormChannelValues(
   const values: GrafanaChannelValues = {
     __id: id,
     type: channel.type as NotifierType,
-    uid: channel.uid,
+    provenance: channel.provenance,
     secureSettings: {},
     settings: { ...channel.settings },
-    sendReminder: channel.sendReminder,
     secureFields: { ...channel.secureFields },
     disableResolveMessage: channel.disableResolveMessage,
   };
 
   // work around https://github.com/grafana/alerting-squad/issues/100
   notifier?.options.forEach((option) => {
-    if (option.secure && values.settings[option.propertyName]) {
+    if (option.secure && values.secureSettings[option.propertyName]) {
       delete values.settings[option.propertyName];
       values.secureFields[option.propertyName] = true;
+    }
+    if (option.secure && values.settings[option.propertyName]) {
+      values.secureSettings[option.propertyName] = values.settings[option.propertyName];
+      delete values.settings[option.propertyName];
     }
   });
 
   return values;
 }
 
-function formChannelValuesToGrafanaChannelConfig(
+export function formChannelValuesToGrafanaChannelConfig(
   values: GrafanaChannelValues,
   defaults: GrafanaChannelValues,
   name: string,
-  existing?: GrafanaManagedReceiverConfig
+  existing?: GrafanaManagedReceiverConfig,
+  notifier?: NotifierDTO
 ): GrafanaManagedReceiverConfig {
   const channel: GrafanaManagedReceiverConfig = {
-    settings: {
+    settings: omitEmptyValues({
       ...(existing && existing.type === values.type ? existing.settings ?? {} : {}),
       ...(values.settings ?? {}),
-    },
-    secureSettings: values.secureSettings ?? {},
+    }),
+    secureSettings: omitEmptyUnlessExisting(values.secureSettings, existing?.secureFields),
     type: values.type,
-    sendReminder: values.sendReminder ?? existing?.sendReminder ?? defaults.sendReminder,
     name,
     disableResolveMessage:
       values.disableResolveMessage ?? existing?.disableResolveMessage ?? defaults.disableResolveMessage,
   };
+
+  // find all secure field definitions
+  const secureFieldNames: string[] =
+    notifier?.options.filter((option) => option.secure).map((option) => option.propertyName) ?? [];
+
+  // we make sure all fields that are marked as "secure" will be moved to "SecureSettings" instead of "settings"
+  const shouldBeSecure = pick(channel.settings, secureFieldNames);
+  channel.secureSettings = {
+    ...shouldBeSecure,
+    ...channel.secureSettings,
+  };
+
+  // remove the secure ones from the regular settings
+  channel.settings = omit(channel.settings, secureFieldNames);
+
   if (existing) {
     channel.uid = existing.uid;
   }
+
   return channel;
+}
+
+// null, undefined and '' are deemed unacceptable
+const isUnacceptableValue = (value: unknown) => isNil(value) || value === '';
+
+// will remove properties that have empty ('', null, undefined) object properties.
+// traverses nested objects and arrays as well. in place, mutates the object.
+// this is needed because form will submit empty string for not filled in fields,
+// but for cloud alertmanager receiver config to use global default value the property must be omitted entirely
+// this isn't a perfect solution though. No way for user to intentionally provide an empty string. Will need rethinking later
+export function omitEmptyValues<T>(obj: T): T {
+  if (isArray(obj)) {
+    obj.forEach(omitEmptyValues);
+  } else if (typeof obj === 'object' && obj !== null) {
+    Object.entries(obj).forEach(([key, value]) => {
+      if (isUnacceptableValue(value)) {
+        delete (obj as any)[key];
+      } else {
+        omitEmptyValues(value);
+      }
+    });
+  }
+  return obj;
+}
+
+// Will remove empty ('', null, undefined) object properties unless they were previously defined.
+// existing is a map of property names that were previously defined.
+export function omitEmptyUnlessExisting(settings = {}, existing = {}): Record<string, unknown> {
+  return omitBy(settings, (value, key) => isUnacceptableValue(value) && !(key in existing));
 }

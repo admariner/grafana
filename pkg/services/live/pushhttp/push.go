@@ -3,65 +3,52 @@ package pushhttp
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 
+	liveDto "github.com/grafana/grafana-plugin-sdk-go/live"
+
 	"github.com/grafana/grafana/pkg/infra/log"
-	"github.com/grafana/grafana/pkg/models"
-	"github.com/grafana/grafana/pkg/registry"
+	contextmodel "github.com/grafana/grafana/pkg/services/contexthandler/model"
 	"github.com/grafana/grafana/pkg/services/live"
 	"github.com/grafana/grafana/pkg/services/live/convert"
 	"github.com/grafana/grafana/pkg/services/live/pushurl"
 	"github.com/grafana/grafana/pkg/setting"
+	"github.com/grafana/grafana/pkg/web"
 )
 
 var (
 	logger = log.New("live.push_http")
 )
 
-func init() {
-	registry.RegisterServiceWithPriority(&Gateway{}, registry.Low)
+func ProvideService(cfg *setting.Cfg, live *live.GrafanaLive) *Gateway {
+	logger.Info("Live Push Gateway initialization")
+	g := &Gateway{
+		Cfg:         cfg,
+		GrafanaLive: live,
+		converter:   convert.NewConverter(),
+	}
+	return g
 }
 
 // Gateway receives data and translates it to Grafana Live publications.
 type Gateway struct {
-	Cfg         *setting.Cfg      `inject:""`
-	GrafanaLive *live.GrafanaLive `inject:""`
+	Cfg         *setting.Cfg
+	GrafanaLive *live.GrafanaLive
 
 	converter *convert.Converter
 }
 
-// Init Gateway.
-func (g *Gateway) Init() error {
-	logger.Info("Telemetry Gateway initialization")
-
-	if !g.IsEnabled() {
-		logger.Debug("Telemetry Gateway not enabled, skipping initialization")
-		return nil
-	}
-
-	g.converter = convert.NewConverter()
-	return nil
-}
-
 // Run Gateway.
 func (g *Gateway) Run(ctx context.Context) error {
-	if !g.IsEnabled() {
-		logger.Debug("GrafanaLive feature not enabled, skipping initialization of Telemetry Gateway")
-		return nil
-	}
 	<-ctx.Done()
 	return ctx.Err()
 }
 
-// IsEnabled returns true if the Grafana Live feature is enabled.
-func (g *Gateway) IsEnabled() bool {
-	return g.Cfg.IsLiveEnabled() // turn on when Live on for now.
-}
+func (g *Gateway) Handle(ctx *contextmodel.ReqContext) {
+	streamID := web.Params(ctx.Req)[":streamId"]
 
-func (g *Gateway) Handle(ctx *models.ReqContext) {
-	streamID := ctx.Params(":streamId")
-
-	stream, err := g.GrafanaLive.ManagedStreamRunner.GetOrCreateStream(streamID)
+	stream, err := g.GrafanaLive.ManagedStreamRunner.GetOrCreateStream(ctx.SignedInUser.OrgID, liveDto.ScopeStream, streamID)
 	if err != nil {
 		logger.Error("Error getting stream", "error", err)
 		ctx.Resp.WriteHeader(http.StatusInternalServerError)
@@ -71,9 +58,8 @@ func (g *Gateway) Handle(ctx *models.ReqContext) {
 	// TODO Grafana 8: decide which formats to use or keep all.
 	urlValues := ctx.Req.URL.Query()
 	frameFormat := pushurl.FrameFormatFromValues(urlValues)
-	unstableSchema := pushurl.UnstableSchemaFromValues(urlValues)
 
-	body, err := ctx.Req.Body().Bytes()
+	body, err := io.ReadAll(ctx.Req.Body)
 	if err != nil {
 		logger.Error("Error reading body", "error", err)
 		ctx.Resp.WriteHeader(http.StatusInternalServerError)
@@ -83,7 +69,6 @@ func (g *Gateway) Handle(ctx *models.ReqContext) {
 		"protocol", "http",
 		"streamId", streamID,
 		"bodyLength", len(body),
-		"unstableSchema", unstableSchema,
 		"frameFormat", frameFormat,
 	)
 
@@ -102,10 +87,47 @@ func (g *Gateway) Handle(ctx *models.ReqContext) {
 	// interval = "1s" vs flush_interval = "5s"
 
 	for _, mf := range metricFrames {
-		err := stream.Push(mf.Key(), mf.Frame(), unstableSchema)
+		err := stream.Push(ctx.Req.Context(), mf.Key(), mf.Frame())
 		if err != nil {
+			logger.Error("Error pushing frame", "error", err, "data", string(body))
 			ctx.Resp.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 	}
+
+	ctx.Resp.WriteHeader(http.StatusOK)
+}
+
+func (g *Gateway) HandlePipelinePush(ctx *contextmodel.ReqContext) {
+	channelID := web.Params(ctx.Req)["*"]
+
+	body, err := io.ReadAll(ctx.Req.Body)
+	if err != nil {
+		logger.Error("Error reading body", "error", err)
+		ctx.Resp.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	logger.Debug("Live channel push request",
+		"protocol", "http",
+		"channel", channelID,
+		"bodyLength", len(body),
+	)
+
+	ruleFound, err := g.GrafanaLive.Pipeline.ProcessInput(ctx.Req.Context(), ctx.OrgID, channelID, body)
+	if err != nil {
+		logger.Error("Pipeline input processing error", "error", err, "body", string(body))
+		if errors.Is(err, liveDto.ErrInvalidChannelID) {
+			ctx.Resp.WriteHeader(http.StatusBadRequest)
+		} else {
+			ctx.Resp.WriteHeader(http.StatusInternalServerError)
+		}
+		return
+	}
+	if !ruleFound {
+		logger.Error("No conversion rule for a channel", "error", err, "channel", channelID)
+		ctx.Resp.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	ctx.Resp.WriteHeader(http.StatusOK)
 }

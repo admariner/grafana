@@ -1,13 +1,10 @@
-import { SelectableValue } from '@grafana/data';
-import React, { FC, useMemo } from 'react';
-import { SelectWithAdd } from './SelectWIthAdd';
+import React, { useMemo } from 'react';
 
-enum AnnotationOptions {
-  description = 'Description',
-  dashboard = 'Dashboard',
-  summary = 'Summary',
-  runbook = 'Runbook URL',
-}
+import { SelectableValue } from '@grafana/data';
+
+import { Annotation, annotationLabels } from '../../utils/constants';
+
+import { SelectWithAdd } from './SelectWIthAdd';
 
 interface Props {
   onChange: (value: string) => void;
@@ -16,22 +13,24 @@ interface Props {
   value?: string;
   width?: number;
   className?: string;
+  'aria-label'?: string;
 }
 
-export const AnnotationKeyInput: FC<Props> = ({ value, existingKeys, ...rest }) => {
+export const AnnotationKeyInput = ({ value, existingKeys, 'aria-label': ariaLabel, ...rest }: Props) => {
   const annotationOptions = useMemo(
     (): SelectableValue[] =>
-      Object.entries(AnnotationOptions)
-        .filter(([optKey]) => !existingKeys.includes(optKey)) // remove keys already taken in other annotations
-        .map(([key, value]) => ({ value: key, label: value })),
+      Object.values(Annotation)
+        .filter((key) => !existingKeys.includes(key)) // remove keys already taken in other annotations
+        .map((key) => ({ value: key, label: annotationLabels[key] })),
     [existingKeys]
   );
 
   return (
     <SelectWithAdd
+      aria-label={ariaLabel}
       value={value}
       options={annotationOptions}
-      custom={!!value && !Object.keys(AnnotationOptions).includes(value)}
+      custom={!!value && !(Object.values(Annotation) as string[]).includes(value)}
       {...rest}
     />
   );
